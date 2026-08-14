@@ -1,0 +1,5 @@
+flask==3.0.3
+gunicorn==22.0.0
+yfinance==0.2.43
+alpaca-py==0.28.1
+tzdata==2024.1
