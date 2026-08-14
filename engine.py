@@ -35,7 +35,10 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 TRADING_DAYS = 252
 RISK_FREE_ANNUAL = 0.04
 
-MIN_TRADES_PER_DAY = 30
+# Minimum desired trades per day. The bot will continue scanning for valid opportunities.
+MIN_TRADES_PER_DAY = 100
+# No artificial maximum. Actual order count is constrained by valid candidates,
+# buying power, liquidity/risk filters, and Alpaca account limits.
 MAX_OPTION_CONTRACTS_PER_TICKER = 4
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
@@ -104,6 +107,9 @@ UNIVERSE = sorted(set(
 # ============================================================
 # ALPACA CREDENTIALS / HTTP
 # ============================================================
+
+REPORT_DIR = Path(os.getenv("REPORT_DIR", "."))
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 ALPACA_API_KEY = ""
 ALPACA_API_SECRET = ""
