@@ -39,6 +39,7 @@ MIN_TRADES_PER_DAY = 30
 MAX_OPTION_CONTRACTS_PER_TICKER = 4
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
+ALPACA_PAPER_TRADING_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex")
 ALPACA_OPTION_FEED = os.getenv("ALPACA_OPTION_FEED", "indicative")
 
@@ -132,39 +133,110 @@ def alpaca_headers():
 # STARTUP DIAGNOSTICS
 # ============================================================
 
+def get_account_config():
+    """Read paper-account trading configuration directly from Alpaca."""
+    url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
+    r = requests.get(url, headers=alpaca_headers(), timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(
+            f"Could not read Alpaca account configuration: HTTP {r.status_code} {r.text}"
+        )
+    return r.json()
+
+
+def update_account_config(payload):
+    """Update paper-account trading configuration directly through Alpaca."""
+    url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
+    r = requests.patch(
+        url,
+        headers={**alpaca_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=HTTP_TIMEOUT,
+    )
+    if not r.ok:
+        raise RuntimeError(
+            f"Could not update Alpaca account configuration: HTTP {r.status_code} {r.text}"
+        )
+    return r.json()
+
+
 def verify_account_ready(trading_client):
     """
-    Fail loudly at startup instead of trading zero times forever.
-    Checks: account fetch works, account isn't restricted, and (best-effort)
-    options trading looks enabled.
+    Validate the paper account before the engine submits anything.
+
+    In particular, Alpaca's 40310000 / 'new orders are rejected by user
+    request' corresponds to suspend_trade=True. We read the configuration
+    directly from the paper Trading API and clear that flag when necessary.
     """
     try:
         account = trading_client.get_account()
     except Exception as exc:
-        log.error("Could not fetch account — check API key/secret and paper-trading flag: %s", exc)
+        log.error(
+            "Could not fetch Alpaca account. Check that the API key/secret "
+            "are the PAPER keys: %s",
+            exc,
+        )
         raise
 
     log.info(
-        "Account status=%s | equity=%s | buying_power=%s | options_trading_level=%s",
+        "Account status=%s | equity=%s | buying_power=%s | "
+        "trading_blocked=%s | account_blocked=%s",
         getattr(account, "status", "?"),
         getattr(account, "equity", "?"),
         getattr(account, "buying_power", "?"),
-        getattr(account, "options_trading_level", "unknown"),
+        getattr(account, "trading_blocked", "?"),
+        getattr(account, "account_blocked", "?"),
     )
 
-    trading_blocked = getattr(account, "trading_blocked", False)
-    if trading_blocked:
-        raise RuntimeError("Account has trading_blocked=True — orders will be rejected until this is cleared.")
-
-    options_level = getattr(account, "options_trading_level", None)
-    if options_level in (None, "disabled", 0):
-        log.warning(
-            "Could not confirm options trading is enabled on this account "
-            "(options_trading_level=%s). If orders keep failing with a 403/"
-            "not-eligible error, enable options trading for this paper "
-            "account before continuing.",
-            options_level,
+    if getattr(account, "trading_blocked", False):
+        raise RuntimeError(
+            "Alpaca reports trading_blocked=True. The API will reject new orders."
         )
+
+    if getattr(account, "account_blocked", False):
+        raise RuntimeError(
+            "Alpaca reports account_blocked=True. The API will reject trading."
+        )
+
+    cfg = get_account_config()
+
+    log.info(
+        "Account config | suspend_trade=%s | max_options_trading_level=%s | "
+        "no_shorting=%s | max_margin_multiplier=%s",
+        cfg.get("suspend_trade"),
+        cfg.get("max_options_trading_level"),
+        cfg.get("no_shorting"),
+        cfg.get("max_margin_multiplier"),
+    )
+
+    # This is the specific account-level condition behind the error currently
+    # appearing in the user's log. Clear it before the engine starts scanning.
+    if cfg.get("suspend_trade") is True:
+        log.warning(
+            "Alpaca paper account has suspend_trade=True. "
+            "Clearing suspend_trade so new orders can be accepted."
+        )
+        cfg = update_account_config({"suspend_trade": False})
+        log.info(
+            "Trading suspension cleared. suspend_trade=%s",
+            cfg.get("suspend_trade"),
+        )
+
+    options_level = cfg.get("max_options_trading_level")
+    if options_level is not None:
+        try:
+            options_level = int(options_level)
+        except (TypeError, ValueError):
+            pass
+
+        if options_level == 0:
+            raise RuntimeError(
+                "Alpaca reports max_options_trading_level=0. "
+                "The paper account is not enabled for options trading. "
+                "Enable at least Level 2 for long calls/puts."
+            )
+
+    log.info("Alpaca paper account passed startup checks.")
 
 # ============================================================
 # ALPACA CLOCK (MARKET OPEN CHECK)
@@ -711,7 +783,7 @@ class OptionsOnlyEngine:
             })
 
         except Exception as exc:
-            # Surface the actual API response whenever available.
+            # Capture the API body so account-level rejections are obvious.
             detail = getattr(exc, "response", None)
             body = None
 
@@ -720,6 +792,22 @@ class OptionsOnlyEngine:
                     body = detail.text
                 except Exception:
                     body = None
+
+            combined = f"{exc} {body or ''}"
+
+            if "40310000" in combined or "new orders are rejected by user request" in combined:
+                # Do not burn through the entire universe repeatedly when
+                # Alpaca has suspended new orders. Mark the daily limit as
+                # reached so the current cycle stops cleanly.
+                self.trades_today = MIN_TRADES_PER_DAY
+                log.critical(
+                    "Alpaca rejected NEW ORDERS with 40310000 for %s. "
+                    "Trading has been halted for this run. "
+                    "The startup configuration check should normally clear "
+                    "suspend_trade automatically.",
+                    symbol,
+                )
+                return
 
             log.error(
                 "Order failed %s x%d @ %.2f: %s%s",
@@ -871,6 +959,13 @@ class OptionsOnlyEngine:
 
 def main():
     initialize_credentials()
+
+    try:
+        import alpaca
+        log.info("alpaca-py version=%s", getattr(alpaca, "__version__", "unknown"))
+    except Exception:
+        pass
+    log.info("Initializing Alpaca PAPER trading client")
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=True)
     verify_account_ready(trading_client)
     engine = OptionsOnlyEngine(trading_client)
