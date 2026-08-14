@@ -8,6 +8,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+import pandas as pd
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
@@ -32,7 +36,7 @@ TRADING_DAYS = 252
 RISK_FREE_ANNUAL = 0.04
 
 MIN_TRADES_PER_DAY = 30
-MAX_OPTION_CONTRACTS_PER_TICKER = 4  # high risk, but still capped
+MAX_OPTION_CONTRACTS_PER_TICKER = 4
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 ALPACA_STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex")
@@ -58,36 +62,27 @@ LOOP_SLEEP_SECONDS = 60
 # ============================================================
 
 SEMICONDUCTOR_TICKERS = [
-    "NVDA", "AMD", "INTC", "TSM", "AVGO",
-    "QCOM", "TXN", "MU", "LRCX", "AMAT",
-    "ADI", "KLAC", "MRVL", "ON", "MCHP",
-    "SWKS", "QRVO", "NXPI", "TER", "ENTG",
-    "MPWR", "CRUS", "SLAB", "POWI", "DIOD",
-    "RMBS", "ALGM", "WOLF", "ONTO", "COHU",
+    "NVDA","AMD","INTC","TSM","AVGO","QCOM","TXN","MU","LRCX","AMAT",
+    "ADI","KLAC","MRVL","ON","MCHP","SWKS","QRVO","NXPI","TER","ENTG",
+    "MPWR","CRUS","SLAB","POWI","DIOD","RMBS","ALGM","WOLF","ONTO","COHU",
 ]
 
 MINING_TICKERS = [
-    "FCX", "NEM", "GOLD", "SCCO", "AEM",
-    "TECK", "RIO", "BHP", "VALE", "MOS",
-    "AA", "CLF", "X", "NUE", "STLD",
-    "MP", "CDE", "HL", "PAAS", "AG",
-    "SSRM", "EGO", "KGC", "AU", "WPM",
-    "FNV", "RGLD", "ALB", "LAC", "SQM",
+    "FCX","NEM","GOLD","SCCO","AEM","TECK","RIO","BHP","VALE","MOS",
+    "AA","CLF","X","NUE","STLD","MP","CDE","HL","PAAS","AG",
+    "SSRM","EGO","KGC","AU","WPM","FNV","RGLD","ALB","LAC","SQM",
 ]
 
 INDUSTRIALS_TICKERS = [
-    "WAB", "JBHT", "ODFL", "XPO", "CHRW",
-    "LSTR", "EXPD", "WERN", "SAIA", "RXO",
-    "TXT", "HEI", "TDG", "CW", "WWD",
-    "AXON", "LII", "WSO", "JCI", "CSL",
-    "MAS", "VMC", "MLM", "WM", "RSG",
-    "CTAS", "ROL", "PWR", "FIX", "EME",
+    "WAB","JBHT","ODFL","XPO","CHRW","LSTR","EXPD","WERN","SAIA","RXO",
+    "TXT","HEI","TDG","CW","WWD","AXON","LII","WSO","JCI","CSL",
+    "MAS","VMC","MLM","WM","RSG","CTAS","ROL","PWR","FIX","EME",
 ]
 
 UNIVERSE = sorted(set(
-    SEMICONDUCTOR_TICKERS
-    + MINING_TICKERS
-    + INDUSTRIALS_TICKERS
+    SEMICONDUCTOR_TICKERS +
+    MINING_TICKERS +
+    INDUSTRIALS_TICKERS
 ))
 
 # ============================================================
@@ -99,7 +94,7 @@ ALPACA_API_SECRET = ""
 
 _HTTP = requests.Session()
 _HTTP.headers.update({
-    "User-Agent": "OptionsOnlyEngine/1.1",
+    "User-Agent": "OptionsOnlyEngine/2.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 })
@@ -117,6 +112,23 @@ def alpaca_headers():
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
         "Accept": "application/json",
     }
+
+# ============================================================
+# ALPACA CLOCK (MARKET OPEN CHECK)
+# ============================================================
+
+def alpaca_clock(trading_client):
+    try:
+        return trading_client.get_clock()
+    except Exception as exc:
+        log.warning("Failed to fetch Alpaca clock: %s", exc)
+        return None
+
+def market_is_open(trading_client):
+    clock = alpaca_clock(trading_client)
+    if not clock:
+        return False
+    return bool(clock.is_open)
 
 # ============================================================
 # CACHE
@@ -149,7 +161,7 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 def iso_utc(dt):
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
 
 # ============================================================
 # GENERIC ALPACA DATA GET
@@ -184,7 +196,7 @@ def alpaca_data_get(path, params=None, label=""):
                         delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 else:
                     delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
+                delay += random.uniform(0.2,0.8)
                 log.warning(
                     "Rate limit (%s) %s attempt %d/%d. Sleeping %.1fs.",
                     label, path, attempt, DATA_MAX_RETRIES, delay,
@@ -194,7 +206,7 @@ def alpaca_data_get(path, params=None, label=""):
 
             if status >= 500:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
+                delay += random.uniform(0.2,0.8)
                 log.warning(
                     "Server error %s (%s) attempt %d/%d. Retrying in %.1fs.",
                     status, label, attempt, DATA_MAX_RETRIES, delay,
@@ -212,7 +224,7 @@ def alpaca_data_get(path, params=None, label=""):
             last_error = exc
             if attempt < DATA_MAX_RETRIES:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
+                delay += random.uniform(0.2,0.8)
                 log.warning(
                     "Request failed (%s) attempt %d/%d: %s. Retrying in %.1fs.",
                     label, attempt, DATA_MAX_RETRIES, exc, delay,
@@ -298,7 +310,7 @@ def volatility_from_bars(bars, window=14):
         return None
     sample = returns[-window:]
     mean = sum(sample) / len(sample)
-    var = sum((r - mean) ** 2 for r in sample) / len(sample)
+    var = sum((r - mean)**2 for r in sample) / len(sample)
     return math.sqrt(var) * math.sqrt(TRADING_DAYS)
 
 def momentum_from_bars(bars, lookback=20):
@@ -324,7 +336,7 @@ class RegimeManager:
                 "Not enough %s history for regime calculation. Using neutral regime.",
                 REGIME_BENCHMARK,
             )
-            return 0.5  # neutral 
+            return 0.5
 
         sma200 = sum(bars[-200:]) / 200
         last = bars[-1]
@@ -359,17 +371,17 @@ def _cdf(x):
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
+    d1 = (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
+    d2 = d1 - sigma*math.sqrt(T)
     if opt_type == "call":
-        return S * _cdf(d1) - K * math.exp(-r * T) * _cdf(d2)
+        return S*_cdf(d1) - K*math.exp(-r*T)*_cdf(d2)
     else:
-        return K * math.exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
+        return K*math.exp(-r*T)*_cdf(-d2) - S*_cdf(-d1)
 
 def bs_delta(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d1 = (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     if opt_type == "call":
         return _cdf(d1)
     else:
@@ -385,8 +397,8 @@ def monte_carlo_paths(S0, mu, sigma, T, steps=20, n_paths=500):
     for _ in range(n_paths):
         S = S0
         for _ in range(steps):
-            z = random.gauss(0, 1)
-            S *= math.exp((mu - 0.5 * sigma * sigma) * dt + sigma * math.sqrt(dt) * z)
+            z = random.gauss(0,1)
+            S *= math.exp((mu - 0.5*sigma*sigma)*dt + sigma*math.sqrt(dt)*z)
         paths.append(S)
     return paths
 
@@ -394,8 +406,8 @@ def mc_expected_move(S0, mu, sigma, T):
     paths = monte_carlo_paths(S0, mu, sigma, T)
     if not paths:
         return 0.0
-    avg = sum(paths) / len(paths)
-    return (avg / S0) - 1.0
+    avg = sum(paths)/len(paths)
+    return (avg/S0) - 1.0
 
 # ============================================================
 # OPTION CHAIN + SANITY CHECKS
@@ -408,12 +420,11 @@ def parse_occ_option_symbol(symbol):
         date_str = tail[:6]
         opt_type = tail[6]
         strike_str = tail[7:]
-
         year = int(date_str[0:2])
         month = int(date_str[2:4])
         day = int(date_str[4:6])
-        expiration = datetime(2000 + year, month, day).date()
-        strike = int(strike_str) / 1000.0
+        expiration = datetime(2000+year, month, day).date()
+        strike = int(strike_str)/1000.0
         return root, expiration, opt_type, strike
     except Exception:
         return None
@@ -461,18 +472,18 @@ def option_chain_calls(underlying):
             trade = snapshot.get("latestTrade", {}) or {}
             greeks = snapshot.get("greeks", {}) or {}
 
-            bid = float(quote.get("bp", 0) or 0)
-            ask = float(quote.get("ap", 0) or 0)
-            volume = int(trade.get("s", 0) or 0)
-            iv = float(snapshot.get("impliedVolatility", 0) or 0)
-            delta = float(greeks.get("delta", 0) or 0)
+            bid = float(quote.get("bp",0) or 0)
+            ask = float(quote.get("ap",0) or 0)
+            volume = int(trade.get("s",0) or 0)
+            iv = float(snapshot.get("impliedVolatility",0) or 0)
+            delta = float(greeks.get("delta",0) or 0)
 
             if bid <= 0 or ask <= 0 or ask < bid:
                 continue
-            mid = (bid + ask) / 2.0
+            mid = (bid+ask)/2.0
             if mid <= 0:
                 continue
-            spread_pct = (ask - bid) / mid
+            spread_pct = (ask-bid)/mid
             if spread_pct > MAX_OPTION_SPREAD_PCT:
                 continue
             if volume < MIN_OPTION_VOLUME:
@@ -541,7 +552,7 @@ class OptionsOnlyEngine:
         self.trading = trading_client
         self.trades_today = 0
         self.last_trade_day = None
-        self.daily_log = []  # for CSV summary
+        self.daily_log = []
 
     def reset_if_new_day(self):
         today = now_et().date()
@@ -563,7 +574,7 @@ class OptionsOnlyEngine:
 
     def existing_option_symbols(self):
         pos = self.positions()
-        return {s for s in pos.keys() if len(s) > 5}  # crude: OCC symbols
+        return {s for s in pos.keys() if len(s) > 5}
 
     def submit_option_buy(self, contract, qty, regime_label, mc_move, bs_val_ratio):
         symbol = contract["symbol"]
@@ -609,14 +620,13 @@ class OptionsOnlyEngine:
         T_years = 30 / TRADING_DAYS
         mu = mom
 
-        # Bull vs bear tilt
         if regime_label == "bull":
             mu *= 1.3
         elif regime_label == "bear":
             mu *= 0.5
 
         mc_move = mc_expected_move(S0, mu, vol, T_years)
-        if mc_move < 0.01:  # require at least +1% expected move
+        if mc_move < 0.01:
             return []
 
         chain = option_chain_calls(symbol)
@@ -628,7 +638,7 @@ class OptionsOnlyEngine:
 
         for c in chain:
             if c["symbol"] in existing_opts:
-                continue  # position tracking: no rebuy of same contract
+                continue
 
             K = c["strike"]
             T = (c["expiration"] - now_et().date()).days / TRADING_DAYS
@@ -641,7 +651,7 @@ class OptionsOnlyEngine:
                 continue
 
             bs_ratio = c["mid"] / model_price
-            if bs_ratio > 1.8:  # sanity: don't pay >80% over BS
+            if bs_ratio > 1.8:
                 continue
 
             moneyness = abs(K - S0) / S0
@@ -653,8 +663,14 @@ class OptionsOnlyEngine:
 
     def run_cycle(self):
         self.reset_if_new_day()
+
+        if not market_is_open(self.trading):
+            log.info("Alpaca clock: market closed, skipping cycle.")
+            return
+
         if not self.can_trade_today():
             log.info("Daily trade target already met (%d)", self.trades_today)
+            self.write_daily_summary()
             return
 
         log.info("Loading market data for %d symbols...", len(UNIVERSE))
@@ -672,8 +688,12 @@ class OptionsOnlyEngine:
             for score, contract, mc_move, bs_ratio in picks:
                 if not self.can_trade_today():
                     break
-                self.submit_option_buy(contract, qty=1, regime_label=regime_label,
-                                       mc_move=mc_move, bs_val_ratio=bs_ratio)
+                self.submit_option_buy(
+                    contract, qty=1,
+                    regime_label=regime_label,
+                    mc_move=mc_move,
+                    bs_val_ratio=bs_ratio,
+                )
 
         log.info("Cycle complete, trades today: %d", self.trades_today)
         self.write_daily_summary()
@@ -682,23 +702,35 @@ class OptionsOnlyEngine:
         if not self.daily_log:
             return
         date_str = now_et().strftime("%Y-%m-%d")
-        filename = f"options_summary_{date_str}.csv"
+
         try:
-            import csv
-            with open(filename, "w", newline="") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "time", "contract", "qty", "regime",
-                        "mc_move_pct", "bs_ratio", "mid", "delta", "iv",
-                    ],
-                )
-                writer.writeheader()
-                for row in self.daily_log:
-                    writer.writerow(row)
-            log.info("Daily summary written to %s (open in Excel or convert to PDF).", filename)
+            df = pd.DataFrame(self.daily_log)
+            xlsx_file = f"options_summary_{date_str}.xlsx"
+            df.to_excel(xlsx_file, index=False)
+            log.info("Daily Excel summary written to %s", xlsx_file)
         except Exception as exc:
-            log.error("Failed to write daily summary: %s", exc)
+            log.error("Failed to write Excel summary: %s", exc)
+
+        try:
+            pdf_file = f"options_summary_{date_str}.pdf"
+            c = canvas.Canvas(pdf_file, pagesize=letter)
+            y = 750
+            for row in self.daily_log:
+                line = (
+                    f"{row['time']} | {row['contract']} | qty={row['qty']} | "
+                    f"regime={row['regime']} | mc={row['mc_move_pct']:.2f}% | "
+                    f"bs={row['bs_ratio']:.2f} | mid={row['mid']:.2f} | "
+                    f"delta={row['delta']:.2f} | iv={row['iv']:.2f}"
+                )
+                c.drawString(30, y, line)
+                y -= 15
+                if y < 50:
+                    c.showPage()
+                    y = 750
+            c.save()
+            log.info("Daily PDF summary written to %s", pdf_file)
+        except Exception as exc:
+            log.error("Failed to write PDF summary: %s", exc)
 
 # ============================================================
 # MAIN LOOP
