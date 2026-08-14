@@ -1,20 +1,30 @@
 import os
-import sys
-import gc
 import time
+import math
 import random
 import logging
 import threading
-from math import sqrt, log as ln, exp, erf
+
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask
+from flask import Flask, jsonify
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
+from alpaca.trading.enums import (
+    OrderSide,
+    OrderType,
+    TimeInForce,
+)
+
+
+# ============================================================
+# FLASK APPLICATION
+# ============================================================
+
+app = Flask(__name__)
 
 
 # ============================================================
@@ -24,152 +34,94 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    stream=sys.stdout,
 )
 
-log = logging.getLogger("options_bs_engine")
+log = logging.getLogger("OPTIONS_BS_ENGINE")
 
 
 # ============================================================
-# FLASK / ENGINE STATE
+# TIME ZONE
 # ============================================================
 
-app = Flask(__name__)
-
-ENGINE_STATE = {
-    "thread_started": False,
-    "thread_alive": False,
-    "last_cycle_started": None,
-    "last_cycle_finished": None,
-    "last_error": None,
-    "trades_today": 0,
-    "market_open": None,
-    "data_provider": "Alpaca",
-    "data_failures": 0,
-    "candidate_count": 0,
-}
+EASTERN_TZ = ZoneInfo(
+    "America/New_York"
+)
 
 
-@app.route("/")
-def home():
-    return "Black-Scholes Options-Only Engine Online - Alpaca", 200
+def now_et():
+    return datetime.now(
+        EASTERN_TZ
+    )
 
 
-@app.route("/health")
-def health():
-    return ENGINE_STATE, 200
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def iso_utc(dt):
+    return (
+        dt.astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 # ============================================================
-# CONFIG
+# ALPACA CREDENTIALS
 # ============================================================
 
-EASTERN_TZ = ZoneInfo("America/New_York")
+ALPACA_API_KEY = os.getenv(
+    "ALPACA_API_KEY",
+    ""
+).strip()
 
-RISK_FREE_ANNUAL = 0.04
-TRADING_DAYS = 252
+ALPACA_API_SECRET = os.getenv(
+    "ALPACA_API_SECRET",
+    ""
+).strip()
 
-# ------------------------------------------------------------
-# DAILY TRADE TARGET
-# ------------------------------------------------------------
-
-# Target and minimum number of OPTION ORDERS submitted per day.
-TARGET_TRADES_PER_DAY = 100
-MIN_TRADES_PER_DAY = 100
-
-# Hard upper ceiling.
-MAX_TRADES_PER_DAY = 125
-
-TRADES_TODAY = 0
-LAST_TRADE_DAY = None
-
-
-# ------------------------------------------------------------
-# OPTION PARAMETERS
-# ------------------------------------------------------------
-
-MIN_OPTION_DTE = 14
-MAX_OPTION_DTE = 45
-
-MIN_OPTION_VOLUME = 10
-MIN_OPEN_INTEREST = 50
-
-MAX_OPTION_SPREAD_PCT = 0.12
-
-# Minimum Black-Scholes discount required.
-#
-# Example:
-# BS value = $2.00
-# Market mid = $1.50
-#
-# Discount = 25%
-#
-# This would qualify if MIN_BS_EDGE_PCT <= 25%.
-MIN_BS_EDGE_PCT = 0.08
-
-# Do not buy options where theoretical value is only
-# a few cents higher than the market.
-MIN_BS_EDGE_DOLLARS = 0.10
-
-# Maximum premium paid per contract.
-MAX_OPTION_PREMIUM = 15.00
-
-# Maximum contracts for any one underlying.
-MAX_CONTRACTS_PER_UNDERLYING = 2
-
-# Maximum total capital deployed through the strategy
-# during a single cycle.
-MAX_CYCLE_OPTION_BUDGET_PCT = 0.20
-
-# Maximum percentage of account equity allocated to
-# one option position.
-MAX_POSITION_BUDGET_PCT = 0.01
-
-# Do not buy options with extremely low or extremely high IV.
-MIN_IV = 0.10
-MAX_IV = 2.50
-
-# Delta ranges.
-CALL_MIN_DELTA = 0.20
-CALL_MAX_DELTA = 0.70
-
-PUT_MIN_ABS_DELTA = 0.20
-PUT_MAX_ABS_DELTA = 0.70
+ALPACA_PAPER = (
+    os.getenv(
+        "ALPACA_PAPER",
+        "true",
+    )
+    .lower()
+    == "true"
+)
 
 
-# ------------------------------------------------------------
-# SIGNAL PARAMETERS
-# ------------------------------------------------------------
-
-MOMENTUM_LOOKBACK = 20
-VOLATILITY_WINDOW = 20
-
-# Directional threshold.
-#
-# Momentum > +2%:
-#     prefer calls
-#
-# Momentum < -2%:
-#     prefer puts
-#
-# Between those:
-#     both sides may qualify.
-DIRECTION_THRESHOLD = 0.02
+if not ALPACA_API_KEY:
+    raise RuntimeError(
+        "ALPACA_API_KEY is not configured."
+    )
 
 
-# ------------------------------------------------------------
-# MARKET WINDOW
-# ------------------------------------------------------------
-
-NO_TRADE_BEFORE = (9, 35)
-NO_TRADE_AFTER = (15, 55)
+if not ALPACA_API_SECRET:
+    raise RuntimeError(
+        "ALPACA_API_SECRET is not configured."
+    )
 
 
-# ------------------------------------------------------------
-# DATA
-# ------------------------------------------------------------
+# ============================================================
+# ALPACA CLIENT
+# ============================================================
 
-ALPACA_DATA_URL = "https://data.alpaca.markets"
+trading_client = TradingClient(
+    ALPACA_API_KEY,
+    ALPACA_API_SECRET,
+    paper=ALPACA_PAPER,
+)
+
+
+# ============================================================
+# ALPACA DATA CONFIGURATION
+# ============================================================
+
+ALPACA_DATA_URL = (
+    "https://data.alpaca.markets"
+)
 
 ALPACA_STOCK_FEED = os.getenv(
     "ALPACA_STOCK_FEED",
@@ -182,145 +134,14 @@ ALPACA_OPTION_FEED = os.getenv(
 )
 
 DATA_BATCH_SIZE = 50
-OPTION_SNAPSHOT_BATCH_SIZE = 100
 
 DATA_MAX_RETRIES = 5
+
 DATA_RETRY_BASE_DELAY = 1.5
 
-DATA_CACHE_TTL_SECONDS = 30
+DATA_CACHE_TTL_SECONDS = 60
 
 HTTP_TIMEOUT = 15
-
-MAX_BARS_DAYS = 220
-
-LOOP_SLEEP_SECONDS = 30
-
-
-# ============================================================
-# OPTIONS-ONLY UNIVERSE
-# ============================================================
-
-SEMICONDUCTOR_TICKERS = [
-    "NVDA",
-    "AMD",
-    "INTC",
-    "TSM",
-    "AVGO",
-    "QCOM",
-    "TXN",
-    "MU",
-    "LRCX",
-    "AMAT",
-    "ADI",
-    "KLAC",
-    "MRVL",
-    "ON",
-    "MCHP",
-    "SWKS",
-    "QRVO",
-    "NXPI",
-    "TER",
-    "ENTG",
-    "MPWR",
-    "CRUS",
-    "SLAB",
-    "POWI",
-    "DIOD",
-    "RMBS",
-    "ALGM",
-    "WOLF",
-    "ONTO",
-    "COHU",
-]
-
-
-MINING_TICKERS = [
-    "FCX",
-    "NEM",
-    "GOLD",
-    "SCCO",
-    "AEM",
-    "TECK",
-    "RIO",
-    "BHP",
-    "VALE",
-    "MOS",
-    "AA",
-    "CLF",
-    "X",
-    "NUE",
-    "STLD",
-    "MP",
-    "CDE",
-    "HL",
-    "PAAS",
-    "AG",
-    "SSRM",
-    "EGO",
-    "KGC",
-    "AU",
-    "WPM",
-    "FNV",
-    "RGLD",
-    "ALB",
-    "LAC",
-    "SQM",
-]
-
-
-PHARMA_TICKERS = [
-    "LLY",
-    "JNJ",
-    "MRK",
-    "ABBV",
-    "PFE",
-    "BMY",
-    "GILD",
-    "AMGN",
-    "REGN",
-    "VRTX",
-    "BIIB",
-    "MRNA",
-    "GSK",
-    "AZN",
-    "NVS",
-    "SNY",
-    "BNTX",
-    "TEVA",
-    "TAK",
-    "ELAN",
-    "UTHR",
-    "INCY",
-    "ALNY",
-    "HALO",
-    "JAZZ",
-    "SRPT",
-    "IONS",
-    "EXEL",
-    "BMRN",
-    "RPRX",
-]
-
-
-def _dedupe(seq):
-    seen = set()
-    result = []
-
-    for symbol in seq:
-        symbol = symbol.upper().strip()
-
-        if symbol and symbol not in seen:
-            seen.add(symbol)
-            result.append(symbol)
-
-    return result
-
-
-OPTIONS_UNIVERSE = _dedupe(
-    SEMICONDUCTOR_TICKERS
-    + MINING_TICKERS
-    + PHARMA_TICKERS
-)
 
 
 # ============================================================
@@ -330,53 +151,33 @@ OPTIONS_UNIVERSE = _dedupe(
 _HTTP = requests.Session()
 
 _HTTP.headers.update({
-    "User-Agent": "BlackScholesOptionsEngine/1.0",
-    "Accept": "application/json",
-    "Connection": "keep-alive",
+    "User-Agent":
+        "BlackScholesOptionsEngine/1.0",
+
+    "Accept":
+        "application/json",
+
+    "Connection":
+        "keep-alive",
 })
-
-
-# ============================================================
-# ALPACA CREDENTIALS
-# ============================================================
-
-ALPACA_API_KEY = ""
-ALPACA_API_SECRET = ""
-
-
-def initialize_credentials():
-
-    global ALPACA_API_KEY
-    global ALPACA_API_SECRET
-
-    ALPACA_API_KEY = os.getenv(
-        "ALPACA_API_KEY",
-        "",
-    ).strip()
-
-    ALPACA_API_SECRET = os.getenv(
-        "ALPACA_API_SECRET",
-        "",
-    ).strip()
-
-    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
-        raise RuntimeError(
-            "ALPACA_API_KEY / ALPACA_API_SECRET "
-            "are not configured."
-        )
 
 
 def alpaca_headers():
 
     return {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
-        "Accept": "application/json",
+        "APCA-API-KEY-ID":
+            ALPACA_API_KEY,
+
+        "APCA-API-SECRET-KEY":
+            ALPACA_API_SECRET,
+
+        "Accept":
+            "application/json",
     }
 
 
 # ============================================================
-# ALPACA DATA REQUEST
+# RESILIENT ALPACA DATA REQUEST
 # ============================================================
 
 def alpaca_data_get(
@@ -385,7 +186,9 @@ def alpaca_data_get(
     label="",
 ):
 
-    url = f"{ALPACA_DATA_URL}{path}"
+    url = (
+        f"{ALPACA_DATA_URL}{path}"
+    )
 
     last_error = None
 
@@ -405,39 +208,63 @@ def alpaca_data_get(
 
             status = response.status_code
 
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
             if 200 <= status < 300:
 
                 try:
+
                     return response.json()
 
                 except ValueError as exc:
 
                     raise RuntimeError(
-                        f"Invalid JSON from Alpaca: {exc}"
+                        "Invalid JSON returned "
+                        f"by Alpaca: {exc}"
                     )
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
 
             if status == 429:
 
-                retry_after = response.headers.get(
-                    "Retry-After"
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
                 )
 
                 if retry_after:
 
                     try:
-                        delay = float(retry_after)
+                        delay = float(
+                            retry_after
+                        )
 
                     except Exception:
                         delay = (
                             DATA_RETRY_BASE_DELAY
-                            * (2 ** (attempt - 1))
+                            * (
+                                2
+                                ** (
+                                    attempt - 1
+                                )
+                            )
                         )
 
                 else:
 
                     delay = (
                         DATA_RETRY_BASE_DELAY
-                        * (2 ** (attempt - 1))
+                        * (
+                            2
+                            ** (
+                                attempt - 1
+                            )
+                        )
                     )
 
                 delay += random.uniform(
@@ -446,22 +273,35 @@ def alpaca_data_get(
                 )
 
                 log.warning(
-                    "Rate limit | %s | retry %d/%d | %.1fs",
+                    "Rate limit | %s | "
+                    "attempt %d/%d | "
+                    "sleep %.1fs",
                     label,
                     attempt,
                     DATA_MAX_RETRIES,
                     delay,
                 )
 
-                time.sleep(delay)
+                time.sleep(
+                    delay
+                )
 
                 continue
+
+            # ------------------------------------------------
+            # SERVER ERROR
+            # ------------------------------------------------
 
             if status >= 500:
 
                 delay = (
                     DATA_RETRY_BASE_DELAY
-                    * (2 ** (attempt - 1))
+                    * (
+                        2
+                        ** (
+                            attempt - 1
+                        )
+                    )
                 )
 
                 delay += random.uniform(
@@ -470,24 +310,42 @@ def alpaca_data_get(
                 )
 
                 log.warning(
-                    "Server error | %s | retry %d/%d",
+                    "Server error %s | "
+                    "%s | "
+                    "attempt %d/%d | "
+                    "sleep %.1fs",
+                    status,
                     label,
                     attempt,
                     DATA_MAX_RETRIES,
+                    delay,
                 )
 
-                time.sleep(delay)
+                time.sleep(
+                    delay
+                )
 
                 continue
 
+            # ------------------------------------------------
+            # CLIENT ERROR
+            # ------------------------------------------------
+
             try:
-                body = response.json()
+
+                body = (
+                    response.json()
+                )
 
             except Exception:
-                body = response.text[:500]
+
+                body = (
+                    response.text[:500]
+                )
 
             raise RuntimeError(
-                f"Alpaca HTTP {status}: {body}"
+                f"Alpaca HTTP {status}: "
+                f"{body}"
             )
 
         except Exception as exc:
@@ -498,7 +356,12 @@ def alpaca_data_get(
 
                 delay = (
                     DATA_RETRY_BASE_DELAY
-                    * (2 ** (attempt - 1))
+                    * (
+                        2
+                        ** (
+                            attempt - 1
+                        )
+                    )
                 )
 
                 delay += random.uniform(
@@ -507,37 +370,51 @@ def alpaca_data_get(
                 )
 
                 log.warning(
-                    "Request failed | %s | "
-                    "retry %d/%d | %s",
+                    "Alpaca request failed | "
+                    "%s | "
+                    "attempt %d/%d | "
+                    "%s | "
+                    "retry %.1fs",
                     label,
                     attempt,
                     DATA_MAX_RETRIES,
                     exc,
+                    delay,
                 )
 
-                time.sleep(delay)
+                time.sleep(
+                    delay
+                )
 
             else:
 
                 log.error(
-                    "Request failed permanently | %s | %s",
+                    "Alpaca request failed | "
+                    "%s | "
+                    "after %d attempts | "
+                    "%s",
                     label,
+                    DATA_MAX_RETRIES,
                     exc,
                 )
 
-    raise last_error or RuntimeError(
-        f"Unknown Alpaca data failure: {label}"
+    raise (
+        last_error
+        or RuntimeError(
+            f"Unknown Alpaca data failure: {label}"
+        )
     )
 
 
 # ============================================================
-# CACHE
+# DATA CACHE
 # ============================================================
 
 _BARS_CACHE = {}
+
 _PRICE_CACHE = {}
-_CONTRACT_CACHE = {}
-_SNAPSHOT_CACHE = {}
+
+_OPTIONS_CACHE = {}
 
 
 def cache_get(
@@ -545,7 +422,9 @@ def cache_get(
     key,
 ):
 
-    item = cache.get(key)
+    item = cache.get(
+        key
+    )
 
     if not item:
         return None
@@ -557,6 +436,7 @@ def cache_get(
         - timestamp
         > DATA_CACHE_TTL_SECONDS
     ):
+
         return None
 
     return value
@@ -575,32 +455,493 @@ def cache_put(
 
 
 # ============================================================
-# DATE HELPERS
+# SYMBOL HELPERS
 # ============================================================
 
-def now_et():
-    return datetime.now(
-        EASTERN_TZ
+def dedupe(
+    symbols,
+):
+
+    seen = set()
+
+    output = []
+
+    for symbol in symbols:
+
+        symbol = (
+            symbol
+            .upper()
+            .strip()
+        )
+
+        if (
+            symbol
+            and symbol not in seen
+        ):
+
+            seen.add(
+                symbol
+            )
+
+            output.append(
+                symbol
+            )
+
+    return output
+
+
+# ============================================================
+# SEMICONDUCTORS
+# ============================================================
+
+SEMICONDUCTOR_TICKERS = [
+
+    "NVDA",
+    "AMD",
+    "AVGO",
+    "INTC",
+    "MU",
+    "QCOM",
+    "TXN",
+    "AMAT",
+    "LRCX",
+    "KLAC",
+    "ADI",
+    "MRVL",
+    "MCHP",
+    "ON",
+    "NXPI",
+    "SWKS",
+    "QRVO",
+    "MPWR",
+    "TER",
+    "WOLF",
+    "ARM",
+    "ASML",
+    "TSM",
+    "ENTG",
+    "ONTO",
+    "CRDO",
+    "ALGM",
+    "SMTC",
+    "SITM",
+    "POWI",
+]
+
+
+# ============================================================
+# MINING / METALS
+# ============================================================
+
+MINING_TICKERS = [
+
+    "FCX",
+    "NEM",
+    "GOLD",
+    "AEM",
+    "SCCO",
+    "TECK",
+    "RIO",
+    "BHP",
+    "VALE",
+    "AA",
+    "CLF",
+    "NUE",
+    "STLD",
+    "MP",
+    "CDE",
+    "HL",
+    "PAAS",
+    "AG",
+    "WPM",
+    "FNV",
+    "ATI",
+    "CMC",
+    "MOS",
+    "CF",
+    "ARCH",
+    "BTU",
+]
+
+
+# ============================================================
+# PHARMA / BIOTECH
+# ============================================================
+
+PHARMA_TICKERS = [
+
+    "LLY",
+    "JNJ",
+    "MRK",
+    "ABBV",
+    "PFE",
+    "BMY",
+    "GILD",
+    "AMGN",
+    "REGN",
+    "VRTX",
+    "BIIB",
+    "MRNA",
+    "GSK",
+    "AZN",
+    "NVS",
+    "SNY",
+    "BNTX",
+    "TEVA",
+    "TAK",
+    "INCY",
+    "ALNY",
+    "EXEL",
+    "BMRN",
+    "UTHR",
+    "ARGX",
+    "IONS",
+    "SRPT",
+    "RARE",
+    "HALO",
+    "NBIX",
+    "JAZZ",
+]
+
+
+# ============================================================
+# FINAL OPTION UNIVERSE
+# ============================================================
+
+OPTION_UNIVERSE = dedupe(
+    SEMICONDUCTOR_TICKERS
+    + MINING_TICKERS
+    + PHARMA_TICKERS
+)
+
+
+OPTIONABLE_SYMBOLS = set(
+    OPTION_UNIVERSE
+)
+
+
+# ============================================================
+# STRATEGY CONFIGURATION
+# ============================================================
+
+TARGET_TRADES_PER_DAY = 100
+
+MAX_TRADES_PER_DAY = 110
+
+MIN_TRADES_PER_DAY = 100
+
+
+# ------------------------------------------------------------
+# OPTION EXPIRATION
+# ------------------------------------------------------------
+
+OPTIONS_MIN_DTE = 14
+
+OPTIONS_MAX_DTE = 45
+
+
+# ------------------------------------------------------------
+# BLACK-SCHOLES
+# ------------------------------------------------------------
+
+RISK_FREE_RATE = 0.04
+
+
+# ------------------------------------------------------------
+# OPTION QUALITY FILTERS
+# ------------------------------------------------------------
+
+MIN_OPTION_VOLUME = 1
+
+MIN_OPEN_INTEREST = 10
+
+MAX_OPTION_SPREAD_PCT = 0.15
+
+MAX_OPTION_PRICE = 15.00
+
+
+# ------------------------------------------------------------
+# EDGE REQUIREMENTS
+# ------------------------------------------------------------
+
+MIN_BS_EDGE = 0.10
+
+MIN_BS_EDGE_PERCENT = 0.08
+
+
+# ------------------------------------------------------------
+# RISK
+# ------------------------------------------------------------
+
+ACCOUNT_RISK_PERCENT = 0.005
+
+MAX_OPTION_CONTRACTS_PER_TRADE = 1
+
+
+# ------------------------------------------------------------
+# ENGINE
+# ------------------------------------------------------------
+
+LOOP_SLEEP_SECONDS = 30
+
+
+# ============================================================
+# DAILY STATE
+# ============================================================
+
+TRADES_TODAY = 0
+
+LAST_TRADE_DAY = None
+
+ENGINE_LOCK = threading.Lock()
+
+
+STATE = {
+
+    "running":
+        False,
+
+    "market_open":
+        False,
+
+    "trades_today":
+        0,
+
+    "target_trades":
+        TARGET_TRADES_PER_DAY,
+
+    "candidates":
+        0,
+
+    "last_cycle":
+        None,
+
+    "last_error":
+        None,
+
+    "paper":
+        ALPACA_PAPER,
+
+    "universe_size":
+        len(OPTION_UNIVERSE),
+}
+
+
+# ============================================================
+# DAILY RESET
+# ============================================================
+
+def reset_daily_counter():
+
+    global TRADES_TODAY
+
+    global LAST_TRADE_DAY
+
+    today = (
+        now_et().date()
     )
 
+    if (
+        LAST_TRADE_DAY
+        != today
+    ):
 
-def utc_now():
-    return datetime.now(
-        timezone.utc
+        LAST_TRADE_DAY = today
+
+        TRADES_TODAY = 0
+
+        STATE[
+            "trades_today"
+        ] = 0
+
+        log.info(
+            "New trading day | "
+            "%s",
+            today,
+        )
+
+
+# ============================================================
+# MARKET CLOCK
+# ============================================================
+
+def market_is_open():
+
+    try:
+
+        clock = (
+            trading_client
+            .get_clock()
+        )
+
+        is_open = bool(
+            clock.is_open
+        )
+
+        STATE[
+            "market_open"
+        ] = is_open
+
+        return is_open
+
+    except Exception as exc:
+
+        log.error(
+            "Unable to read Alpaca clock: %s",
+            exc,
+        )
+
+        STATE[
+            "market_open"
+        ] = False
+
+        return False
+
+
+# ============================================================
+# TRADING WINDOW
+# ============================================================
+
+def valid_trade_time():
+
+    current = now_et()
+
+    current_minutes = (
+        current.hour * 60
+        + current.minute
     )
 
+    start_minutes = (
+        9 * 60
+        + 35
+    )
 
-def iso_utc(dt):
+    end_minutes = (
+        15 * 60
+        + 45
+    )
 
     return (
-        dt.astimezone(timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
+        start_minutes
+        <= current_minutes
+        <= end_minutes
     )
 
 
 # ============================================================
-# STOCK DATA
+# BLACK-SCHOLES NORMAL CDF
+# ============================================================
+
+def normal_cdf(
+    x,
+):
+
+    return (
+        1.0
+        + math.erf(
+            x
+            / math.sqrt(2.0)
+        )
+    ) / 2.0
+
+
+# ============================================================
+# BLACK-SCHOLES PRICING
+# ============================================================
+
+def black_scholes_price(
+    stock_price,
+    strike_price,
+    time_to_expiry,
+    volatility,
+    risk_free_rate,
+    option_type,
+):
+
+    if stock_price <= 0:
+        return 0.0
+
+    if strike_price <= 0:
+        return 0.0
+
+    if time_to_expiry <= 0:
+        return 0.0
+
+    if volatility <= 0:
+        return 0.0
+
+    try:
+
+        d1 = (
+            math.log(
+                stock_price
+                / strike_price
+            )
+            + (
+                risk_free_rate
+                + (
+                    volatility
+                    ** 2
+                )
+                / 2.0
+            )
+            * time_to_expiry
+        ) / (
+            volatility
+            * math.sqrt(
+                time_to_expiry
+            )
+        )
+
+        d2 = (
+            d1
+            - volatility
+            * math.sqrt(
+                time_to_expiry
+            )
+        )
+
+        if (
+            option_type
+            == "call"
+        ):
+
+            value = (
+                stock_price
+                * normal_cdf(d1)
+                - strike_price
+                * math.exp(
+                    -risk_free_rate
+                    * time_to_expiry
+                )
+                * normal_cdf(d2)
+            )
+
+        else:
+
+            value = (
+                strike_price
+                * math.exp(
+                    -risk_free_rate
+                    * time_to_expiry
+                )
+                * normal_cdf(-d2)
+                - stock_price
+                * normal_cdf(-d1)
+            )
+
+        return max(
+            float(value),
+            0.0,
+        )
+
+    except Exception:
+
+        return 0.0
+
+
+# ============================================================
+# HISTORICAL STOCK BARS
 # ============================================================
 
 def alpaca_bars_many(
@@ -608,18 +949,24 @@ def alpaca_bars_many(
     days=60,
 ):
 
-    symbols = _dedupe(symbols)
+    symbols = dedupe(
+        symbols
+    )
 
     if not symbols:
         return {}
 
     days = min(
         int(days),
-        MAX_BARS_DAYS,
+        220,
     )
 
     cache_key = (
-        tuple(sorted(symbols)),
+        tuple(
+            sorted(
+                symbols
+            )
+        ),
         days,
         ALPACA_STOCK_FEED,
     )
@@ -633,7 +980,10 @@ def alpaca_bars_many(
         return cached
 
     calendar_days = (
-        int(days * 1.55) + 15
+        int(
+            days * 1.55
+        )
+        + 15
     )
 
     end_dt = utc_now()
@@ -658,18 +1008,39 @@ def alpaca_bars_many(
 
         batch = symbols[
             start_index:
-            start_index + DATA_BATCH_SIZE
+            start_index
+            + DATA_BATCH_SIZE
         ]
 
         params = {
-            "symbols": ",".join(batch),
-            "timeframe": "1Day",
-            "start": iso_utc(start_dt),
-            "end": iso_utc(end_dt),
-            "feed": ALPACA_STOCK_FEED,
-            "adjustment": "split",
-            "sort": "asc",
-            "limit": 10000,
+
+            "symbols":
+                ",".join(batch),
+
+            "timeframe":
+                "1Day",
+
+            "start":
+                iso_utc(
+                    start_dt
+                ),
+
+            "end":
+                iso_utc(
+                    end_dt
+                ),
+
+            "feed":
+                ALPACA_STOCK_FEED,
+
+            "adjustment":
+                "split",
+
+            "sort":
+                "asc",
+
+            "limit":
+                10000,
         }
 
         try:
@@ -677,53 +1048,61 @@ def alpaca_bars_many(
             data = alpaca_data_get(
                 "/v2/stocks/bars",
                 params=params,
-                label="bars",
+                label="stock bars",
             )
 
-            bars = data.get(
-                "bars",
-                {},
+            bars = (
+                data.get(
+                    "bars",
+                    {}
+                )
             )
 
             if not isinstance(
                 bars,
                 dict,
             ):
-                continue
+
+                bars = {}
 
             for symbol in batch:
 
+                symbol_bars = (
+                    bars.get(
+                        symbol,
+                        []
+                    )
+                )
+
                 closes = []
 
-                for bar in bars.get(
-                    symbol,
-                    [],
-                ):
+                for bar in symbol_bars:
 
-                    try:
+                    close = bar.get(
+                        "c"
+                    )
 
-                        close = float(
-                            bar["c"]
-                        )
+                    if close is not None:
 
-                        if close > 0:
+                        try:
+
                             closes.append(
-                                close
+                                float(close)
                             )
 
-                    except Exception:
-                        continue
+                        except Exception:
+                            pass
 
-                result[symbol] = closes[-days:]
+                result[
+                    symbol
+                ] = closes[-days:]
 
         except Exception as exc:
 
-            ENGINE_STATE[
-                "data_failures"
-            ] += 1
-
-            log.error(
-                "Historical data batch failed: %s",
+            log.warning(
+                "Historical bars failed | "
+                "%s | %s",
+                ",".join(batch),
                 exc,
             )
 
@@ -736,15 +1115,103 @@ def alpaca_bars_many(
     return result
 
 
-def latest_prices_many(symbols):
+# ============================================================
+# HISTORICAL VOLATILITY
+# ============================================================
 
-    symbols = _dedupe(symbols)
+def calculate_historical_volatility(
+    prices,
+):
+
+    if len(prices) < 21:
+        return None
+
+    returns = []
+
+    for i in range(
+        1,
+        len(prices),
+    ):
+
+        previous = prices[
+            i - 1
+        ]
+
+        current = prices[
+            i
+        ]
+
+        if previous <= 0:
+            continue
+
+        try:
+
+            returns.append(
+                math.log(
+                    current
+                    / previous
+                )
+            )
+
+        except Exception:
+            pass
+
+    if len(returns) < 20:
+        return None
+
+    returns = returns[
+        -20:
+    ]
+
+    mean = (
+        sum(returns)
+        / len(returns)
+    )
+
+    variance = (
+        sum(
+            (
+                value
+                - mean
+            ) ** 2
+            for value in returns
+        )
+        / (
+            len(returns) - 1
+        )
+    )
+
+    volatility = (
+        math.sqrt(
+            variance
+        )
+        * math.sqrt(252)
+    )
+
+    return volatility
+
+
+# ============================================================
+# CURRENT STOCK PRICES
+# ============================================================
+
+def get_current_stock_prices(
+    symbols,
+):
+
+    symbols = dedupe(
+        symbols
+    )
 
     if not symbols:
         return {}
 
     cache_key = (
-        tuple(sorted(symbols)),
+        tuple(
+            sorted(
+                symbols
+            )
+        ),
         ALPACA_STOCK_FEED,
     )
 
@@ -756,7 +1223,7 @@ def latest_prices_many(symbols):
     if cached is not None:
         return cached
 
-    result = {}
+    prices = {}
 
     for start_index in range(
         0,
@@ -766,299 +1233,153 @@ def latest_prices_many(symbols):
 
         batch = symbols[
             start_index:
-            start_index + DATA_BATCH_SIZE
+            start_index
+            + DATA_BATCH_SIZE
         ]
 
         params = {
-            "symbols": ",".join(batch),
-            "feed": ALPACA_STOCK_FEED,
+
+            "symbols":
+                ",".join(batch),
+
+            "feed":
+                ALPACA_STOCK_FEED,
         }
 
         try:
 
             data = alpaca_data_get(
-                "/v2/stocks/trades/latest",
+                "/v2/stocks/snapshots",
                 params=params,
-                label="latest prices",
+                label="stock snapshots",
             )
 
-            trades = data.get(
-                "trades",
-                {},
+            snapshots = (
+                data.get(
+                    "snapshots",
+                    {}
+                )
             )
 
-            for symbol in batch:
+            for symbol, snapshot in (
+                snapshots.items()
+            ):
 
-                trade = trades.get(
-                    symbol
+                latest_trade = (
+                    snapshot.get(
+                        "latestTrade"
+                    )
+                    or {}
                 )
 
-                if not trade:
-                    continue
+                price = (
+                    latest_trade.get(
+                        "p"
+                    )
+                )
 
-                try:
+                if price is None:
 
-                    price = float(
-                        trade["p"]
+                    daily_bar = (
+                        snapshot.get(
+                            "dailyBar"
+                        )
+                        or {}
                     )
 
-                    if price > 0:
-                        result[symbol] = price
+                    price = (
+                        daily_bar.get(
+                            "c"
+                        )
+                    )
 
-                except Exception:
-                    continue
+                if price is not None:
+
+                    try:
+
+                        prices[
+                            symbol
+                        ] = float(
+                            price
+                        )
+
+                    except Exception:
+                        pass
 
         except Exception as exc:
 
-            ENGINE_STATE[
-                "data_failures"
-            ] += 1
-
             log.warning(
-                "Latest prices failed: %s",
+                "Price request failed | "
+                "%s | %s",
+                ",".join(batch),
                 exc,
             )
 
     cache_put(
         _PRICE_CACHE,
         cache_key,
-        result,
+        prices,
     )
 
-    return result
+    return prices
 
 
 # ============================================================
-# MOMENTUM
-# ============================================================
-
-def momentum_from_bars(
-    bars,
-    lookback=MOMENTUM_LOOKBACK,
-):
-
-    if len(bars) < lookback + 1:
-        return None
-
-    try:
-
-        return (
-            bars[-1]
-            / bars[-lookback]
-        ) - 1.0
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# HISTORICAL VOLATILITY
-# ============================================================
-
-def volatility_from_bars(
-    bars,
-    window=VOLATILITY_WINDOW,
-):
-
-    if len(bars) < window + 1:
-        return None
-
-    returns = []
-
-    for i in range(
-        1,
-        len(bars),
-    ):
-
-        previous = bars[i - 1]
-        current = bars[i]
-
-        if previous <= 0:
-            continue
-
-        try:
-
-            returns.append(
-                (current / previous)
-                - 1.0
-            )
-
-        except Exception:
-            continue
-
-    if len(returns) < window:
-        return None
-
-    sample = returns[-window:]
-
-    mean = (
-        sum(sample)
-        / len(sample)
-    )
-
-    variance = (
-        sum(
-            (r - mean) ** 2
-            for r in sample
-        )
-        / len(sample)
-    )
-
-    return sqrt(
-        variance
-    ) * sqrt(TRADING_DAYS)
-
-
-# ============================================================
-# BLACK-SCHOLES
-# ============================================================
-
-def normal_cdf(x):
-
-    return 0.5 * (
-        1.0
-        + erf(
-            x / sqrt(2.0)
-        )
-    )
-
-
-def bs_price(
-    S,
-    K,
-    T,
-    r,
-    sigma,
-    option_type,
-):
-
-    if (
-        S <= 0
-        or K <= 0
-        or T <= 0
-        or sigma <= 0
-    ):
-        return 0.0
-
-    d1 = (
-        ln(S / K)
-        + (
-            r
-            + 0.5 * sigma * sigma
-        ) * T
-    ) / (
-        sigma * sqrt(T)
-    )
-
-    d2 = (
-        d1
-        - sigma * sqrt(T)
-    )
-
-    if option_type == "call":
-
-        return (
-            S * normal_cdf(d1)
-            - K
-            * exp(-r * T)
-            * normal_cdf(d2)
-        )
-
-    return (
-        K
-        * exp(-r * T)
-        * normal_cdf(-d2)
-        - S
-        * normal_cdf(-d1)
-    )
-
-
-def bs_delta(
-    S,
-    K,
-    T,
-    r,
-    sigma,
-    option_type,
-):
-
-    if (
-        S <= 0
-        or K <= 0
-        or T <= 0
-        or sigma <= 0
-    ):
-        return 0.0
-
-    d1 = (
-        ln(S / K)
-        + (
-            r
-            + 0.5 * sigma * sigma
-        ) * T
-    ) / (
-        sigma * sqrt(T)
-    )
-
-    if option_type == "call":
-        return normal_cdf(d1)
-
-    return (
-        normal_cdf(d1)
-        - 1.0
-    )
-
-
-# ============================================================
-# OPTION CONTRACT DATA
+# OPTION CONTRACTS
 # ============================================================
 
 def get_option_contracts(
     underlying,
 ):
 
-    underlying = (
-        underlying.upper()
+    today = (
+        now_et().date()
+    )
+
+    expiration_min = (
+        today
+        + timedelta(
+            days=OPTIONS_MIN_DTE
+        )
+    )
+
+    expiration_max = (
+        today
+        + timedelta(
+            days=OPTIONS_MAX_DTE
+        )
     )
 
     cache_key = (
         underlying,
-        MIN_OPTION_DTE,
-        MAX_OPTION_DTE,
+        expiration_min,
+        expiration_max,
     )
 
     cached = cache_get(
-        _CONTRACT_CACHE,
+        _OPTIONS_CACHE,
         cache_key,
     )
 
     if cached is not None:
         return cached
 
-    today = now_et().date()
-
-    min_expiration = (
-        today
-        + timedelta(
-            days=MIN_OPTION_DTE
-        )
-    )
-
-    max_expiration = (
-        today
-        + timedelta(
-            days=MAX_OPTION_DTE
-        )
-    )
-
     params = {
-        "underlying_symbols": underlying,
-        "status": "active",
+
+        "underlying_symbols":
+            underlying,
+
+        "status":
+            "active",
+
         "expiration_date_gte":
-            min_expiration.isoformat(),
+            expiration_min.isoformat(),
+
         "expiration_date_lte":
-            max_expiration.isoformat(),
-        "limit": 1000,
+            expiration_max.isoformat(),
+
+        "limit":
+            1000,
     }
 
     try:
@@ -1066,120 +1387,29 @@ def get_option_contracts(
         data = alpaca_data_get(
             "/v2/options/contracts",
             params=params,
-            label=f"contracts:{underlying}",
+            label=f"contracts {underlying}",
         )
 
-        contracts = data.get(
-            "option_contracts",
-            [],
+        contracts = (
+            data.get(
+                "option_contracts",
+                []
+            )
         )
-
-        clean = []
-
-        for contract in contracts:
-
-            try:
-
-                if not contract.get(
-                    "tradable",
-                    False,
-                ):
-                    continue
-
-                expiration = datetime.strptime(
-                    contract[
-                        "expiration_date"
-                    ],
-                    "%Y-%m-%d",
-                ).date()
-
-                if (
-                    expiration
-                    < min_expiration
-                    or expiration
-                    > max_expiration
-                ):
-                    continue
-
-                option_type = (
-                    contract.get(
-                        "type",
-                        ""
-                    ).lower()
-                )
-
-                if option_type not in (
-                    "call",
-                    "put",
-                ):
-                    continue
-
-                clean.append({
-                    "symbol":
-                        contract["symbol"],
-
-                    "underlying":
-                        underlying,
-
-                    "expiration":
-                        expiration,
-
-                    "type":
-                        option_type,
-
-                    "strike":
-                        float(
-                            contract[
-                                "strike_price"
-                            ]
-                        ),
-
-                    "open_interest":
-                        int(
-                            contract.get(
-                                "open_interest",
-                                0
-                            )
-                            or 0
-                        ),
-
-                    "size":
-                        int(
-                            contract.get(
-                                "size",
-                                100
-                            )
-                            or 100
-                        ),
-
-                    "tradable":
-                        bool(
-                            contract.get(
-                                "tradable",
-                                False
-                            )
-                        ),
-                })
-
-            except Exception:
-                continue
 
         cache_put(
-            _CONTRACT_CACHE,
+            _OPTIONS_CACHE,
             cache_key,
-            clean,
+            contracts,
         )
 
-        return clean
+        return contracts
 
     except Exception as exc:
 
-        ENGINE_STATE[
-            "data_failures"
-        ] += 1
-
         log.warning(
-            "Contract lookup failed for %s: %s",
+            "Option contracts failed | "
+            "%s | %s",
             underlying,
             exc,
         )
@@ -1192,259 +1422,109 @@ def get_option_contracts(
 # ============================================================
 
 def get_option_snapshots(
-    contract_symbols,
+    underlying,
 ):
 
-    symbols = _dedupe(
-        contract_symbols
-    )
+    params = {
 
-    if not symbols:
+        "feed":
+            ALPACA_OPTION_FEED,
+
+        "limit":
+            1000,
+    }
+
+    try:
+
+        data = alpaca_data_get(
+            f"/v1beta1/options/snapshots/{underlying}",
+            params=params,
+            label=f"option snapshots {underlying}",
+        )
+
+        return (
+            data.get(
+                "snapshots",
+                {}
+            )
+        )
+
+    except Exception as exc:
+
+        log.warning(
+            "Option snapshots failed | "
+            "%s | %s",
+            underlying,
+            exc,
+        )
+
         return {}
 
-    result = {}
-
-    for start_index in range(
-        0,
-        len(symbols),
-        OPTION_SNAPSHOT_BATCH_SIZE,
-    ):
-
-        batch = symbols[
-            start_index:
-            start_index
-            + OPTION_SNAPSHOT_BATCH_SIZE
-        ]
-
-        params = {
-            "symbols": ",".join(batch),
-            "feed": ALPACA_OPTION_FEED,
-            "limit": 1000,
-        }
-
-        try:
-
-            data = alpaca_data_get(
-                "/v1beta1/options/snapshots",
-                params=params,
-                label="option snapshots",
-            )
-
-            snapshots = data.get(
-                "snapshots",
-                {},
-            )
-
-            if not isinstance(
-                snapshots,
-                dict,
-            ):
-                continue
-
-            for symbol in batch:
-
-                snapshot = snapshots.get(
-                    symbol
-                )
-
-                if not snapshot:
-                    continue
-
-                quote = (
-                    snapshot.get(
-                        "latestQuote",
-                        {}
-                    )
-                    or {}
-                )
-
-                trade = (
-                    snapshot.get(
-                        "latestTrade",
-                        {}
-                    )
-                    or {}
-                )
-
-                greeks = (
-                    snapshot.get(
-                        "greeks",
-                        {}
-                    )
-                    or {}
-                )
-
-                try:
-
-                    bid = float(
-                        quote.get(
-                            "bp",
-                            0
-                        )
-                        or 0
-                    )
-
-                    ask = float(
-                        quote.get(
-                            "ap",
-                            0
-                        )
-                        or 0
-                    )
-
-                    volume = int(
-                        trade.get(
-                            "s",
-                            0
-                        )
-                        or 0
-                    )
-
-                    iv = float(
-                        snapshot.get(
-                            "impliedVolatility",
-                            0
-                        )
-                        or 0
-                    )
-
-                    delta = float(
-                        greeks.get(
-                            "delta",
-                            0
-                        )
-                        or 0
-                    )
-
-                    result[symbol] = {
-                        "bid": bid,
-                        "ask": ask,
-                        "volume": volume,
-                        "iv": iv,
-                        "delta": delta,
-                    }
-
-                except Exception:
-                    continue
-
-        except Exception as exc:
-
-            ENGINE_STATE[
-                "data_failures"
-            ] += 1
-
-            log.warning(
-                "Option snapshot batch failed: %s",
-                exc,
-            )
-
-    return result
-
 
 # ============================================================
-# OPTION LIQUIDITY
+# OPTION CANDIDATE BUILDER
 # ============================================================
 
-def option_liquidity_ok(
-    snapshot,
-):
-
-    bid = snapshot["bid"]
-    ask = snapshot["ask"]
-
-    if bid <= 0:
-        return False
-
-    if ask <= 0:
-        return False
-
-    if ask < bid:
-        return False
-
-    mid = (
-        bid + ask
-    ) / 2.0
-
-    if mid <= 0:
-        return False
-
-    spread_pct = (
-        ask - bid
-    ) / mid
-
-    if (
-        spread_pct
-        > MAX_OPTION_SPREAD_PCT
-    ):
-        return False
-
-    if (
-        snapshot["volume"]
-        < MIN_OPTION_VOLUME
-    ):
-        return False
-
-    return True
-
-
-# ============================================================
-# OPTION CANDIDATE SCORING
-# ============================================================
-
-def build_option_candidates(
-    market_data,
-    prices,
-):
+def build_option_candidates():
 
     candidates = []
 
-    for underlying in OPTIONS_UNIVERSE:
+    prices = (
+        get_current_stock_prices(
+            OPTION_UNIVERSE
+        )
+    )
 
-        bars = market_data.get(
-            underlying,
-            [],
+    if not prices:
+
+        log.warning(
+            "No underlying prices available."
         )
 
-        spot = prices.get(
-            underlying,
-            0.0,
+        return []
+
+    bars = (
+        alpaca_bars_many(
+            OPTION_UNIVERSE,
+            days=60,
+        )
+    )
+
+    for underlying in OPTION_UNIVERSE:
+
+        stock_price = prices.get(
+            underlying
         )
 
-        if spot <= 0:
+        if not stock_price:
             continue
 
-        if len(bars) < 60:
-            continue
-
-        momentum = (
-            momentum_from_bars(
-                bars,
-                MOMENTUM_LOOKBACK,
+        historical_prices = (
+            bars.get(
+                underlying,
+                []
             )
         )
 
-        if momentum is None:
-            continue
-
-        historical_vol = (
-            volatility_from_bars(
-                bars,
-                VOLATILITY_WINDOW,
+        volatility = (
+            calculate_historical_volatility(
+                historical_prices
             )
         )
 
-        if (
-            historical_vol is None
-            or historical_vol <= 0
-        ):
+        if not volatility:
             continue
 
-        historical_vol = max(
-            MIN_IV,
-            min(
-                historical_vol,
-                MAX_IV,
-            ),
+        # Avoid absurd values caused by
+        # bad or extremely thin data.
+        volatility = max(
+            volatility,
+            0.15,
+        )
+
+        volatility = min(
+            volatility,
+            1.50,
         )
 
         contracts = (
@@ -1456,276 +1536,321 @@ def build_option_candidates(
         if not contracts:
             continue
 
-        contract_symbols = [
-            c["symbol"]
-            for c in contracts
-        ]
-
         snapshots = (
             get_option_snapshots(
-                contract_symbols
+                underlying
             )
         )
 
+        if not snapshots:
+            continue
+
         for contract in contracts:
 
-            snapshot = snapshots.get(
-                contract["symbol"]
-            )
+            try:
 
-            if not snapshot:
-                continue
+                if not contract.get(
+                    "tradable",
+                    False,
+                ):
 
-            if not option_liquidity_ok(
-                snapshot
-            ):
-                continue
+                    continue
 
-            bid = snapshot["bid"]
-            ask = snapshot["ask"]
+                option_symbol = (
+                    contract.get(
+                        "symbol"
+                    )
+                )
 
-            mid = (
-                bid + ask
-            ) / 2.0
+                if not option_symbol:
+                    continue
 
-            if mid <= 0:
-                continue
+                snapshot = (
+                    snapshots.get(
+                        option_symbol
+                    )
+                )
 
-            if (
-                mid
-                > MAX_OPTION_PREMIUM
-            ):
-                continue
+                if not snapshot:
+                    continue
 
-            iv = snapshot["iv"]
+                quote = (
+                    snapshot.get(
+                        "latestQuote"
+                    )
+                    or {}
+                )
 
-            if iv <= 0:
-                iv = historical_vol
+                bid = float(
+                    quote.get(
+                        "bp",
+                        0
+                    )
+                    or 0
+                )
 
-            iv = max(
-                MIN_IV,
-                min(
-                    iv,
-                    MAX_IV,
-                ),
-            )
+                ask = float(
+                    quote.get(
+                        "ap",
+                        0
+                    )
+                    or 0
+                )
 
-            expiration = (
-                contract[
-                    "expiration"
-                ]
-            )
+                if bid <= 0:
+                    continue
 
-            dte = (
-                expiration
-                - now_et().date()
-            ).days
+                if ask <= 0:
+                    continue
 
-            if dte <= 0:
-                continue
+                if ask < bid:
+                    continue
 
-            T = (
-                dte
-                / TRADING_DAYS
-            )
+                mid = (
+                    bid
+                    + ask
+                ) / 2.0
 
-            option_type = (
-                contract["type"]
-            )
-
-            strike = (
-                contract["strike"]
-            )
-
-            theoretical = bs_price(
-                spot,
-                strike,
-                T,
-                RISK_FREE_ANNUAL,
-                historical_vol,
-                option_type,
-            )
-
-            if theoretical <= 0:
-                continue
-
-            edge_dollars = (
-                theoretical
-                - mid
-            )
-
-            edge_pct = (
-                edge_dollars
-                / theoretical
-            )
-
-            if (
-                edge_dollars
-                < MIN_BS_EDGE_DOLLARS
-            ):
-                continue
-
-            if (
-                edge_pct
-                < MIN_BS_EDGE_PCT
-            ):
-                continue
-
-            bs_delta_value = bs_delta(
-                spot,
-                strike,
-                T,
-                RISK_FREE_ANNUAL,
-                historical_vol,
-                option_type,
-            )
-
-            # ------------------------------------------------
-            # DIRECTION FILTER
-            # ------------------------------------------------
-
-            if option_type == "call":
+                if mid <= 0:
+                    continue
 
                 if (
-                    bs_delta_value
-                    < CALL_MIN_DELTA
-                    or bs_delta_value
-                    > CALL_MAX_DELTA
+                    mid
+                    > MAX_OPTION_PRICE
                 ):
                     continue
 
-                # Strongly bearish stocks should not
-                # automatically create call trades.
+                spread_pct = (
+                    ask
+                    - bid
+                ) / mid
+
                 if (
-                    momentum
-                    < -DIRECTION_THRESHOLD
+                    spread_pct
+                    > MAX_OPTION_SPREAD_PCT
                 ):
                     continue
 
-            else:
+                option_type = (
+                    str(
+                        contract.get(
+                            "type",
+                            ""
+                        )
+                    )
+                    .lower()
+                )
 
-                abs_delta = abs(
-                    bs_delta_value
+                if option_type not in (
+                    "call",
+                    "put",
+                ):
+
+                    continue
+
+                strike = float(
+                    contract.get(
+                        "strike_price",
+                        0
+                    )
+                )
+
+                if strike <= 0:
+                    continue
+
+                expiration_string = (
+                    contract.get(
+                        "expiration_date"
+                    )
+                )
+
+                if not expiration_string:
+                    continue
+
+                expiration = (
+                    datetime.strptime(
+                        expiration_string,
+                        "%Y-%m-%d",
+                    ).date()
+                )
+
+                dte = (
+                    expiration
+                    - now_et().date()
+                ).days
+
+                if (
+                    dte
+                    < OPTIONS_MIN_DTE
+                ):
+                    continue
+
+                if (
+                    dte
+                    > OPTIONS_MAX_DTE
+                ):
+                    continue
+
+                time_to_expiry = (
+                    dte
+                    / 365.0
+                )
+
+                theoretical_value = (
+                    black_scholes_price(
+                        stock_price=stock_price,
+                        strike_price=strike,
+                        time_to_expiry=time_to_expiry,
+                        volatility=volatility,
+                        risk_free_rate=RISK_FREE_RATE,
+                        option_type=option_type,
+                    )
                 )
 
                 if (
-                    abs_delta
-                    < PUT_MIN_ABS_DELTA
-                    or abs_delta
-                    > PUT_MAX_ABS_DELTA
+                    theoretical_value
+                    <= 0
                 ):
                     continue
 
-                # Strongly bullish stocks should not
-                # automatically create put trades.
+                edge = (
+                    theoretical_value
+                    - mid
+                )
+
+                edge_percent = (
+                    edge
+                    / theoretical_value
+                )
+
                 if (
-                    momentum
-                    > DIRECTION_THRESHOLD
+                    edge
+                    < MIN_BS_EDGE
                 ):
                     continue
 
-            spread_pct = (
-                ask - bid
-            ) / mid
+                if (
+                    edge_percent
+                    < MIN_BS_EDGE_PERCENT
+                ):
+                    continue
 
-            # ------------------------------------------------
-            # SCORE
-            # ------------------------------------------------
-
-            liquidity_score = (
-                min(
-                    snapshot["volume"],
-                    10000,
+                trade = (
+                    snapshot.get(
+                        "latestTrade"
+                    )
+                    or {}
                 )
-                / 10000.0
-            )
 
-            oi_score = (
-                min(
-                    contract[
-                        "open_interest"
-                    ],
-                    10000,
+                volume = int(
+                    trade.get(
+                        "s",
+                        0
+                    )
+                    or 0
                 )
-                / 10000.0
-            )
 
-            score = (
-                edge_pct * 5.0
-                + liquidity_score
-                + oi_score
-                - spread_pct * 2.0
-            )
+                open_interest = int(
+                    contract.get(
+                        "open_interest",
+                        0
+                    )
+                    or 0
+                )
 
-            candidates.append({
-                "symbol":
-                    contract["symbol"],
+                if (
+                    volume
+                    < MIN_OPTION_VOLUME
+                ):
+                    continue
 
-                "underlying":
-                    underlying,
+                if (
+                    open_interest
+                    < MIN_OPEN_INTEREST
+                ):
+                    continue
 
-                "type":
-                    option_type,
+                greeks = (
+                    snapshot.get(
+                        "greeks"
+                    )
+                    or {}
+                )
 
-                "strike":
-                    strike,
+                delta = float(
+                    greeks.get(
+                        "delta",
+                        0
+                    )
+                    or 0
+                )
 
-                "expiration":
-                    expiration,
+                candidates.append({
 
-                "dte":
-                    dte,
+                    "symbol":
+                        option_symbol,
 
-                "spot":
-                    spot,
+                    "underlying":
+                        underlying,
 
-                "bid":
-                    bid,
+                    "option_type":
+                        option_type,
 
-                "ask":
-                    ask,
+                    "strike":
+                        strike,
 
-                "mid":
-                    mid,
+                    "expiration":
+                        expiration_string,
 
-                "iv":
-                    iv,
+                    "dte":
+                        dte,
 
-                "historical_vol":
-                    historical_vol,
+                    "stock_price":
+                        stock_price,
 
-                "delta":
-                    bs_delta_value,
+                    "bid":
+                        bid,
 
-                "theoretical":
-                    theoretical,
+                    "ask":
+                        ask,
 
-                "edge_dollars":
-                    edge_dollars,
+                    "mid":
+                        mid,
 
-                "edge_pct":
-                    edge_pct,
+                    "theoretical":
+                        theoretical_value,
 
-                "momentum":
-                    momentum,
+                    "edge":
+                        edge,
 
-                "volume":
-                    snapshot["volume"],
+                    "edge_percent":
+                        edge_percent,
 
-                "open_interest":
-                    contract[
-                        "open_interest"
-                    ],
+                    "spread_percent":
+                        spread_pct,
 
-                "spread_pct":
-                    spread_pct,
+                    "volume":
+                        volume,
 
-                "score":
-                    score,
-            })
+                    "open_interest":
+                        open_interest,
 
+                    "delta":
+                        delta,
+
+                    "volatility":
+                        volatility,
+                })
+
+            except Exception:
+                continue
+
+    # Highest Black-Scholes discount first.
     candidates.sort(
-        key=lambda x: x["score"],
+        key=lambda item:
+        item[
+            "edge_percent"
+        ],
         reverse=True,
     )
 
@@ -1733,40 +1858,12 @@ def build_option_candidates(
 
 
 # ============================================================
-# ACCOUNT
+# EXISTING POSITIONS
 # ============================================================
 
-def get_equity(
-    trading_client,
-):
+def get_existing_positions():
 
-    try:
-
-        account = (
-            trading_client.get_account()
-        )
-
-        return float(
-            account.equity
-        )
-
-    except Exception as exc:
-
-        log.error(
-            "Failed to fetch equity: %s",
-            exc,
-        )
-
-        return 0.0
-
-
-# ============================================================
-# POSITIONS
-# ============================================================
-
-def get_positions(
-    trading_client,
-):
+    symbols = set()
 
     try:
 
@@ -1775,272 +1872,237 @@ def get_positions(
             .get_all_positions()
         )
 
-        return {
-            p.symbol: p
-            for p in positions
-        }
+        for position in positions:
+
+            symbol = getattr(
+                position,
+                "symbol",
+                None,
+            )
+
+            if symbol:
+
+                symbols.add(
+                    symbol
+                )
 
     except Exception as exc:
 
         log.warning(
-            "Failed to fetch positions: %s",
+            "Could not retrieve positions: %s",
             exc,
         )
 
-        return {}
+    return symbols
 
 
 # ============================================================
 # OPEN ORDERS
 # ============================================================
 
-def get_open_orders(
-    trading_client,
-):
+def get_open_order_symbols():
+
+    symbols = set()
 
     try:
 
-        return (
+        orders = (
             trading_client
-            .get_orders(
-                filter=None
+            .get_orders()
+        )
+
+        for order in orders:
+
+            symbol = getattr(
+                order,
+                "symbol",
+                None,
             )
-        )
+
+            if symbol:
+
+                symbols.add(
+                    symbol
+                )
 
     except Exception as exc:
 
         log.warning(
-            "Failed to fetch open orders: %s",
+            "Could not retrieve open orders: %s",
             exc,
         )
 
-        return []
+    return symbols
 
 
 # ============================================================
-# TRADE COUNTER
+# ACCOUNT EQUITY
 # ============================================================
 
-def reset_trade_counter_if_new_day():
-
-    global TRADES_TODAY
-    global LAST_TRADE_DAY
-
-    today = now_et().date()
-
-    if LAST_TRADE_DAY != today:
-
-        LAST_TRADE_DAY = today
-
-        TRADES_TODAY = 0
-
-        ENGINE_STATE[
-            "trades_today"
-        ] = 0
-
-        log.info(
-            "New trading day. "
-            "Option trade counter reset."
-        )
-
-
-# ============================================================
-# MARKET WINDOW
-# ============================================================
-
-def in_trade_window():
-
-    current = now_et()
-
-    current_minutes = (
-        current.hour * 60
-        + current.minute
-    )
-
-    before = (
-        NO_TRADE_BEFORE[0] * 60
-        + NO_TRADE_BEFORE[1]
-    )
-
-    after = (
-        NO_TRADE_AFTER[0] * 60
-        + NO_TRADE_AFTER[1]
-    )
-
-    return (
-        current_minutes >= before
-        and current_minutes < after
-    )
-
-
-def market_is_open(
-    trading_client,
-):
+def get_account_equity():
 
     try:
 
-        clock = (
+        account = (
             trading_client
-            .get_clock()
+            .get_account()
         )
 
-        is_open = bool(
-            clock.is_open
+        equity = float(
+            account.equity
         )
 
-        ENGINE_STATE[
-            "market_open"
-        ] = is_open
-
-        if not is_open:
-            return False
-
-        if not in_trade_window():
-            return False
-
-        return True
+        return equity
 
     except Exception as exc:
 
-        log.warning(
-            "Alpaca clock failed: %s",
+        log.error(
+            "Account lookup failed: %s",
             exc,
         )
 
-        return in_trade_window()
+        return None
 
 
 # ============================================================
-# SAFE OPTION ORDER
+# ORDER SIZE
 # ============================================================
 
-def assert_option_order(
-    symbol,
+def calculate_quantity(
+    option_price,
 ):
 
-    if not symbol:
-        raise ValueError(
-            "Missing option symbol."
-        )
+    equity = (
+        get_account_equity()
+    )
 
-    # OCC-style option symbols contain
-    # a call/put marker in the contract.
-    #
-    # We also explicitly restrict the
-    # trading asset class to US_OPTION.
-    return True
+    if equity is None:
+        return 0
 
+    if option_price <= 0:
+        return 0
+
+    maximum_dollars = (
+        equity
+        * ACCOUNT_RISK_PERCENT
+    )
+
+    contract_cost = (
+        option_price
+        * 100.0
+    )
+
+    if contract_cost <= 0:
+        return 0
+
+    quantity = int(
+        maximum_dollars
+        / contract_cost
+    )
+
+    quantity = min(
+        quantity,
+        MAX_OPTION_CONTRACTS_PER_TRADE,
+    )
+
+    return max(
+        quantity,
+        0,
+    )
+
+
+# ============================================================
+# SUBMIT OPTION BUY
+# ============================================================
 
 def submit_option_order(
-    trading_client,
     candidate,
-    equity,
 ):
 
     global TRADES_TODAY
-
-    reset_trade_counter_if_new_day()
 
     if (
         TRADES_TODAY
         >= MAX_TRADES_PER_DAY
     ):
-        return False
 
-    if not market_is_open(
-        trading_client
-    ):
         return False
 
     symbol = candidate[
         "symbol"
     ]
 
-    assert_option_order(
-        symbol
-    )
-
-    # --------------------------------------------------------
-    # POSITION SIZING
-    # --------------------------------------------------------
-
-    budget_per_trade = (
-        equity
-        * MAX_POSITION_BUDGET_PCT
-    )
-
-    contract_cost = (
-        candidate["mid"]
-        * 100
-    )
-
-    if contract_cost <= 0:
-        return False
-
-    max_qty_by_budget = int(
-        budget_per_trade
-        / contract_cost
-    )
-
-    qty = min(
-        max_qty_by_budget,
-        MAX_CONTRACTS_PER_UNDERLYING,
-    )
-
-    if qty <= 0:
-        return False
-
-    # --------------------------------------------------------
-    # LIMIT PRICE
-    # --------------------------------------------------------
-
-    bid = candidate["bid"]
-    ask = candidate["ask"]
-    theoretical = candidate[
-        "theoretical"
+    bid = candidate[
+        "bid"
     ]
 
-    mid = (
-        bid + ask
-    ) / 2.0
+    ask = candidate[
+        "ask"
+    ]
 
-    # Do not chase the ask if the option is
-    # materially above Black-Scholes value.
-    max_price = min(
-        ask,
-        theoretical * 0.98,
-    )
-
-    if max_price <= 0:
+    if bid <= 0 or ask <= 0:
         return False
 
-    # Never submit below the bid.
-    limit_price = max(
-        bid,
-        min(
-            mid,
-            max_price,
-        ),
-    )
+    # --------------------------------------------------------
+    # START AT MIDPOINT
+    # --------------------------------------------------------
+
+    limit_price = (
+        bid
+        + ask
+    ) / 2.0
 
     limit_price = round(
         limit_price,
         2,
     )
 
-    if limit_price <= 0:
+    if limit_price < bid:
+        limit_price = bid
+
+    if limit_price > ask:
+        limit_price = ask
+
+    # --------------------------------------------------------
+    # POSITION SIZE
+    # --------------------------------------------------------
+
+    quantity = (
+        calculate_quantity(
+            limit_price
+        )
+    )
+
+    if quantity < 1:
+
+        log.info(
+            "Skipping %s | "
+            "insufficient account "
+            "size for 1 contract.",
+            symbol,
+        )
+
         return False
 
     # --------------------------------------------------------
-    # OPTION ORDER ONLY
+    # OPTIONS ONLY
+    #
+    # BUY means buy-to-open for a
+    # new option position.
     # --------------------------------------------------------
 
     order = LimitOrderRequest(
+
         symbol=symbol,
-        qty=qty,
+
+        qty=quantity,
+
         side=OrderSide.BUY,
+
         type=OrderType.LIMIT,
+
         time_in_force=TimeInForce.DAY,
+
         limit_price=limit_price,
     )
 
@@ -2055,38 +2117,70 @@ def submit_option_order(
 
         TRADES_TODAY += 1
 
-        ENGINE_STATE[
+        STATE[
             "trades_today"
         ] = TRADES_TODAY
 
+        order_id = getattr(
+            result,
+            "id",
+            "unknown",
+        )
+
         log.info(
-            "OPTION ORDER #%d | "
-            "%s | %s | "
-            "strike=%.2f | "
-            "DTE=%d | "
-            "mid=%.2f | "
-            "limit=%.2f | "
-            "BS=%.2f | "
-            "edge=%.1f%% | "
-            "delta=%.3f | "
-            "qty=%d | "
-            "id=%s",
+            "OPTION TRADE #%d | "
+            "BUY | "
+            "%s | "
+            "%s | "
+            "strike %.2f | "
+            "expiration %s | "
+            "DTE %d | "
+            "bid %.2f | "
+            "ask %.2f | "
+            "limit %.2f | "
+            "BS %.2f | "
+            "edge %.2f | "
+            "edge %.1f%% | "
+            "delta %.3f | "
+            "qty %d | "
+            "order %s",
             TRADES_TODAY,
-            candidate["underlying"],
-            candidate["type"].upper(),
-            candidate["strike"],
-            candidate["dte"],
-            candidate["mid"],
+            candidate[
+                "underlying"
+            ],
+            candidate[
+                "option_type"
+            ].upper(),
+            candidate[
+                "strike"
+            ],
+            candidate[
+                "expiration"
+            ],
+            candidate[
+                "dte"
+            ],
+            candidate[
+                "bid"
+            ],
+            candidate[
+                "ask"
+            ],
             limit_price,
-            candidate["theoretical"],
-            candidate["edge_pct"] * 100,
-            candidate["delta"],
-            qty,
-            getattr(
-                result,
-                "id",
-                "unknown",
-            ),
+            candidate[
+                "theoretical"
+            ],
+            candidate[
+                "edge"
+            ],
+            candidate[
+                "edge_percent"
+            ] * 100,
+            candidate[
+                "delta"
+            ],
+            quantity,
+            order_id,
         )
 
         return True
@@ -2094,7 +2188,8 @@ def submit_option_order(
     except Exception as exc:
 
         log.warning(
-            "Option order failed | %s | %s",
+            "OPTION ORDER FAILED | "
+            "%s | %s",
             symbol,
             exc,
         )
@@ -2103,164 +2198,127 @@ def submit_option_order(
 
 
 # ============================================================
-# MAIN OPTIONS ENGINE
+# MAIN STRATEGY
 # ============================================================
 
-class BlackScholesOptionsEngine:
+def run_strategy():
 
-    def __init__(
-        self,
-        trading_client,
+    global TRADES_TODAY
+
+    reset_daily_counter()
+
+    if (
+        TRADES_TODAY
+        >= TARGET_TRADES_PER_DAY
     ):
 
-        self.trading = (
-            trading_client
-        )
-
-    # --------------------------------------------------------
-    # PRELOAD DATA
-    # --------------------------------------------------------
-
-    def preload_market_data(self):
-
         log.info(
-            "Loading historical data "
-            "for %d option underlyings.",
-            len(OPTIONS_UNIVERSE),
-        )
-
-        data = alpaca_bars_many(
-            OPTIONS_UNIVERSE,
-            days=MAX_BARS_DAYS,
-        )
-
-        successful = sum(
-            1
-            for symbol in OPTIONS_UNIVERSE
-            if len(
-                data.get(
-                    symbol,
-                    []
-                )
-            ) >= 60
-        )
-
-        log.info(
-            "Usable underlyings: "
+            "Daily target already reached | "
             "%d/%d",
-            successful,
-            len(OPTIONS_UNIVERSE),
+            TRADES_TODAY,
+            TARGET_TRADES_PER_DAY,
         )
 
-        return data
+        return
 
-    # --------------------------------------------------------
-    # EXISTING OPTION SYMBOLS
-    # --------------------------------------------------------
+    if not market_is_open():
 
-    def existing_option_symbols(self):
-
-        positions = get_positions(
-            self.trading
+        log.info(
+            "Market is closed."
         )
 
-        open_orders = get_open_orders(
-            self.trading
+        return
+
+    if not valid_trade_time():
+
+        log.info(
+            "Outside strategy trading window."
         )
 
-        blocked = set()
+        return
 
-        for symbol in positions:
-            blocked.add(
-                symbol
-            )
-
-        for order in open_orders:
-
-            symbol = getattr(
-                order,
-                "symbol",
-                None,
-            )
-
-            if symbol:
-                blocked.add(
-                    symbol
-                )
-
-        return blocked
-
-    # --------------------------------------------------------
-    # EXECUTE CANDIDATES
-    # --------------------------------------------------------
-
-    def execute_candidates(
-        self,
-        candidates,
+    if not ENGINE_LOCK.acquire(
+        blocking=False
     ):
 
-        reset_trade_counter_if_new_day()
-
-        if (
-            TRADES_TODAY
-            >= TARGET_TRADES_PER_DAY
-        ):
-            return 0
-
-        equity = get_equity(
-            self.trading
+        log.info(
+            "Previous strategy cycle "
+            "is still running."
         )
 
-        if equity <= 0:
-            return 0
+        return
+
+    try:
+
+        log.info(
+            "===================================================="
+        )
+
+        log.info(
+            "BLACK-SCHOLES OPTIONS SCAN"
+        )
+
+        log.info(
+            "===================================================="
+        )
+
+        log.info(
+            "Universe: %d symbols",
+            len(
+                OPTION_UNIVERSE
+            ),
+        )
+
+        log.info(
+            "Trades today: %d/%d",
+            TRADES_TODAY,
+            TARGET_TRADES_PER_DAY,
+        )
+
+        log.info(
+            "Paper trading: %s",
+            ALPACA_PAPER,
+        )
+
+        candidates = (
+            build_option_candidates()
+        )
+
+        STATE[
+            "candidates"
+        ] = len(candidates)
+
+        log.info(
+            "Qualified candidates: %d",
+            len(candidates),
+        )
+
+        if not candidates:
+
+            log.warning(
+                "No qualified option "
+                "candidates found."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # BLOCK DUPLICATES
+        # ----------------------------------------------------
 
         blocked = (
-            self.existing_option_symbols()
+            get_existing_positions()
         )
 
-        # Track underlying exposure
-        # so we do not dump dozens of
-        # contracts into one ticker.
-        underlying_counts = {}
-
-        for symbol in blocked:
-
-            # OCC roots are variable length.
-            # Use candidate matching instead
-            # of trying to parse roots here.
-            for candidate in candidates:
-
-                if (
-                    candidate["symbol"]
-                    == symbol
-                ):
-
-                    underlying = (
-                        candidate[
-                            "underlying"
-                        ]
-                    )
-
-                    underlying_counts[
-                        underlying
-                    ] = (
-                        underlying_counts.get(
-                            underlying,
-                            0
-                        )
-                        + 1
-                    )
-
-                    break
-
-        placed = 0
-
-        cycle_budget = (
-            equity
-            * MAX_CYCLE_OPTION_BUDGET_PCT
+        blocked.update(
+            get_open_order_symbols()
         )
 
-        estimated_spend = 0.0
+        submitted_this_cycle = 0
+
+        # ----------------------------------------------------
+        # SUBMIT OPTIONS
+        # ----------------------------------------------------
 
         for candidate in candidates:
 
@@ -2268,232 +2326,49 @@ class BlackScholesOptionsEngine:
                 TRADES_TODAY
                 >= TARGET_TRADES_PER_DAY
             ):
+
                 break
 
             symbol = candidate[
                 "symbol"
             ]
 
-            underlying = candidate[
-                "underlying"
-            ]
-
             if symbol in blocked:
+
                 continue
 
-            if (
-                underlying_counts.get(
-                    underlying,
-                    0
+            success = (
+                submit_option_order(
+                    candidate
                 )
-                >= MAX_CONTRACTS_PER_UNDERLYING
-            ):
-                continue
-
-            estimated_order_cost = (
-                candidate["mid"]
-                * 100
             )
 
-            if (
-                estimated_spend
-                + estimated_order_cost
-                > cycle_budget
-            ):
-                continue
+            if success:
 
-            log.info(
-                "CANDIDATE | "
-                "%s | %s | "
-                "spot=%.2f | "
-                "strike=%.2f | "
-                "dte=%d | "
-                "mid=%.2f | "
-                "BS=%.2f | "
-                "edge=%.1f%% | "
-                "momentum=%.2f%%",
-                underlying,
-                candidate["type"].upper(),
-                candidate["spot"],
-                candidate["strike"],
-                candidate["dte"],
-                candidate["mid"],
-                candidate["theoretical"],
-                candidate["edge_pct"] * 100,
-                candidate["momentum"] * 100,
-            )
+                submitted_this_cycle += 1
 
-            if submit_option_order(
-                self.trading,
-                candidate,
-                equity,
-            ):
-
-                placed += 1
-
-                estimated_spend += (
-                    estimated_order_cost
+                blocked.add(
+                    symbol
                 )
 
-                underlying_counts[
-                    underlying
-                ] = (
-                    underlying_counts.get(
-                        underlying,
-                        0
-                    )
-                    + 1
-                )
-
-        return placed
-
-    # --------------------------------------------------------
-    # ONE CYCLE
-    # --------------------------------------------------------
-
-    def run_once(self):
-
-        reset_trade_counter_if_new_day()
-
-        if not market_is_open(
-            self.trading
-        ):
-            return
-
-        if (
-            TRADES_TODAY
-            >= TARGET_TRADES_PER_DAY
-        ):
-            log.info(
-                "Daily target already reached: "
-                "%d/%d",
-                TRADES_TODAY,
-                TARGET_TRADES_PER_DAY,
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # HISTORICAL DATA
-        # ----------------------------------------------------
-
-        market_data = (
-            self.preload_market_data()
-        )
-
-        # ----------------------------------------------------
-        # PRICES
-        # ----------------------------------------------------
-
-        usable_symbols = [
-            symbol
-            for symbol in OPTIONS_UNIVERSE
-            if len(
-                market_data.get(
-                    symbol,
-                    []
-                )
-            ) >= 60
-        ]
-
-        prices = latest_prices_many(
-            usable_symbols
-        )
-
-        # ----------------------------------------------------
-        # BLACK-SCHOLES CANDIDATES
-        # ----------------------------------------------------
-
-        candidates = (
-            build_option_candidates(
-                market_data,
-                prices,
-            )
-        )
-
-        ENGINE_STATE[
-            "candidate_count"
-        ] = len(candidates)
-
-        log.info(
-            "Black-Scholes candidates: %d",
-            len(candidates),
-        )
-
-        # ----------------------------------------------------
-        # TRADE
-        # ----------------------------------------------------
-
-        placed = (
-            self.execute_candidates(
-                candidates
-            )
-        )
-
-        # ----------------------------------------------------
-        # DAILY MINIMUM
-        # ----------------------------------------------------
-
-        reset_trade_counter_if_new_day()
-
-        if (
-            TRADES_TODAY
-            < MIN_TRADES_PER_DAY
-        ):
-
-            log.warning(
-                "DAILY MINIMUM NOT YET REACHED | "
-                "%d/%d option orders submitted.",
-                TRADES_TODAY,
-                MIN_TRADES_PER_DAY,
-            )
-
-        else:
-
-            log.info(
-                "DAILY MINIMUM REACHED | "
-                "%d option orders submitted.",
-                TRADES_TODAY,
+            # Small delay so we do not
+            # hammer the trading endpoint.
+            time.sleep(
+                0.15
             )
 
         log.info(
             "Cycle complete | "
-            "candidates=%d | "
-            "new_orders=%d | "
-            "trades_today=%d",
-            len(candidates),
-            placed,
+            "new orders=%d | "
+            "total today=%d/%d",
+            submitted_this_cycle,
             TRADES_TODAY,
+            TARGET_TRADES_PER_DAY,
         )
 
-        gc.collect()
+    finally:
 
-
-# ============================================================
-# ENVIRONMENT HELPERS
-# ============================================================
-
-def _env_bool(
-    name,
-    default=True,
-):
-
-    value = os.getenv(
-        name
-    )
-
-    if value is None:
-        return default
-
-    return (
-        value.strip().lower()
-        in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-    )
+        ENGINE_LOCK.release()
 
 
 # ============================================================
@@ -2502,156 +2377,60 @@ def _env_bool(
 
 def trading_loop():
 
-    ENGINE_STATE[
-        "thread_started"
+    STATE[
+        "running"
     ] = True
 
-    ENGINE_STATE[
-        "thread_alive"
-    ] = True
-
-    try:
-
-        initialize_credentials()
-
-    except Exception as exc:
-
-        log.error(
-            "Credential initialization failed: %s",
-            exc,
-        )
-
-        ENGINE_STATE[
-            "last_error"
-        ] = str(exc)
-
-        ENGINE_STATE[
-            "thread_alive"
-        ] = False
-
-        return
-
-    paper = _env_bool(
-        "ALPACA_PAPER",
-        True,
+    log.info(
+        "===================================================="
     )
 
     log.info(
-        "=================================================="
+        "BLACK-SCHOLES OPTIONS ENGINE STARTED"
     )
 
     log.info(
-        "BLACK-SCHOLES OPTIONS-ONLY ENGINE"
-    )
-
-    log.info(
-        "=================================================="
+        "===================================================="
     )
 
     log.info(
         "Paper trading: %s",
-        paper,
+        ALPACA_PAPER,
     )
 
     log.info(
-        "Stock feed: %s",
-        ALPACA_STOCK_FEED,
+        "Option universe: %d symbols",
+        len(
+            OPTION_UNIVERSE
+        ),
     )
-
-    log.info(
-        "Option feed: %s",
-        ALPACA_OPTION_FEED,
-    )
-
-    log.info(
-        "Universe size: %d",
-        len(OPTIONS_UNIVERSE),
-    )
-
-    log.info(
-        "Daily target: %d",
-        TARGET_TRADES_PER_DAY,
-    )
-
-    # --------------------------------------------------------
-    # ALPACA
-    # --------------------------------------------------------
-
-    try:
-
-        trading_client = TradingClient(
-            ALPACA_API_KEY,
-            ALPACA_API_SECRET,
-            paper=paper,
-        )
-
-    except Exception as exc:
-
-        log.exception(
-            "Failed to initialize Alpaca: %s",
-            exc,
-        )
-
-        ENGINE_STATE[
-            "last_error"
-        ] = str(exc)
-
-        ENGINE_STATE[
-            "thread_alive"
-        ] = False
-
-        return
-
-    # --------------------------------------------------------
-    # OPTIONS-ONLY ENGINE
-    # --------------------------------------------------------
-
-    engine = (
-        BlackScholesOptionsEngine(
-            trading_client
-        )
-    )
-
-    # --------------------------------------------------------
-    # MAIN LOOP
-    # --------------------------------------------------------
 
     while True:
 
-        ENGINE_STATE[
-            "last_cycle_started"
-        ] = now_et().isoformat()
-
         try:
 
-            engine.run_once()
+            reset_daily_counter()
 
-            ENGINE_STATE[
+            STATE[
+                "last_cycle"
+            ] = now_et().isoformat()
+
+            run_strategy()
+
+            STATE[
                 "last_error"
             ] = None
 
         except Exception as exc:
 
-            log.exception(
-                "Engine cycle error: %s",
-                exc,
-            )
-
-            ENGINE_STATE[
+            STATE[
                 "last_error"
             ] = str(exc)
 
-        ENGINE_STATE[
-            "last_cycle_finished"
-        ] = now_et().isoformat()
-
-        gc.collect()
-
-        log.info(
-            "Cycle finished. "
-            "Sleeping %ss.",
-            LOOP_SLEEP_SECONDS,
-        )
+            log.exception(
+                "Strategy error: %s",
+                exc,
+            )
 
         time.sleep(
             LOOP_SLEEP_SECONDS
@@ -2659,50 +2438,165 @@ def trading_loop():
 
 
 # ============================================================
-# THREAD WRAPPER
+# FLASK ROUTES
 # ============================================================
 
-def _thread_wrapper():
+@app.route("/")
+def home():
 
-    try:
+    return jsonify({
 
-        trading_loop()
+        "status":
+            "online",
 
-    except Exception as exc:
+        "engine":
+            "Black-Scholes Options Only",
 
-        log.exception(
-            "Trading thread crashed: %s",
-            exc,
-        )
+        "paper":
+            ALPACA_PAPER,
 
-        ENGINE_STATE[
-            "last_error"
-        ] = (
-            f"Thread crashed: {exc}"
-        )
+        "trades_today":
+            STATE[
+                "trades_today"
+            ],
 
-        ENGINE_STATE[
-            "thread_alive"
-        ] = False
+        "target":
+            TARGET_TRADES_PER_DAY,
+
+        "candidates":
+            STATE[
+                "candidates"
+            ],
+
+        "universe_size":
+            len(
+                OPTION_UNIVERSE
+            ),
+
+        "sectors":
+            [
+                "Semiconductors",
+                "Mining",
+                "Pharma",
+            ],
+    })
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health")
+def health():
+
+    return jsonify(
+        STATE
+    )
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+@app.route("/status")
+def status():
+
+    return jsonify({
+
+        "running":
+            STATE[
+                "running"
+            ],
+
+        "market_open":
+            STATE[
+                "market_open"
+            ],
+
+        "trades_today":
+            STATE[
+                "trades_today"
+            ],
+
+        "target_trades":
+            TARGET_TRADES_PER_DAY,
+
+        "minimum_target":
+            MIN_TRADES_PER_DAY,
+
+        "candidates":
+            STATE[
+                "candidates"
+            ],
+
+        "last_cycle":
+            STATE[
+                "last_cycle"
+            ],
+
+        "last_error":
+            STATE[
+                "last_error"
+            ],
+
+        "paper":
+            ALPACA_PAPER,
+
+        "universe_size":
+            len(
+                OPTION_UNIVERSE
+            ),
+    })
 
 
 # ============================================================
 # START ENGINE
 # ============================================================
 
-threading.Thread(
-    target=_thread_wrapper,
-    daemon=True,
-).start()
+def start_engine():
 
-log.info(
-    "Black-Scholes options trading "
-    "thread launched."
-)
+    thread = threading.Thread(
+        target=trading_loop,
+        daemon=True,
+        name="options-trading-engine",
+    )
+
+    thread.start()
+
+    return thread
 
 
 # ============================================================
-# FLASK SERVER
+# IMPORTANT:
+#
+# Gunicorn imports this file.
+#
+# We start ONE engine thread.
+#
+# DO NOT run Gunicorn with multiple workers.
+# ============================================================
+
+_ENGINE_STARTED = False
+
+
+def ensure_engine_started():
+
+    global _ENGINE_STARTED
+
+    if _ENGINE_STARTED:
+        return
+
+    _ENGINE_STARTED = True
+
+    start_engine()
+
+
+# Start when imported by Gunicorn.
+ensure_engine_started()
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -2710,7 +2604,7 @@ if __name__ == "__main__":
     port = int(
         os.getenv(
             "PORT",
-            10000,
+            "10000",
         )
     )
 
