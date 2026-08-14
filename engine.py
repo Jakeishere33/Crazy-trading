@@ -6,6 +6,7 @@ import random
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import requests
 import pandas as pd
@@ -35,10 +36,7 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 TRADING_DAYS = 252
 RISK_FREE_ANNUAL = 0.04
 
-# Minimum desired trades per day. The bot will continue scanning for valid opportunities.
 MIN_TRADES_PER_DAY = 100
-# No artificial maximum. Actual order count is constrained by valid candidates,
-# buying power, liquidity/risk filters, and Alpaca account limits.
 MAX_OPTION_CONTRACTS_PER_TICKER = 4
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
@@ -55,29 +53,18 @@ DATA_CACHE_TTL_SECONDS = 60
 OPTIONS_MIN_DTE = 20
 OPTIONS_MAX_DTE = 45
 
-# NOTE: the "indicative" options feed frequently returns volume=0 on
-# contracts that are perfectly tradeable (it isn't a live trade feed).
-# A hard `volume < MIN_OPTION_VOLUME` filter against that feed can silently
-# zero out every candidate. We now accept a contract if EITHER volume OR
-# open interest clears the bar, and both bars are configurable via env vars
-# so you can tighten them once you confirm the engine is actually finding
-# and submitting orders.
 MIN_OPTION_VOLUME = int(os.getenv("MIN_OPTION_VOLUME", "0"))
 MIN_OPTION_OPEN_INTEREST = int(os.getenv("MIN_OPTION_OPEN_INTEREST", "10"))
 MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.25"))
-
-# Limit order pricing: how far above the displayed ask we're willing to pay,
-# as a fraction of the mid price. Keeps orders marketable without being a
-# true market order (which Alpaca generally rejects for options).
 LIMIT_PRICE_SLIPPAGE_PCT = float(os.getenv("LIMIT_PRICE_SLIPPAGE_PCT", "0.03"))
 
 REGIME_BENCHMARK = "VOO"
-REGIME_LOOKBACK_DAYS = 260  # need 200+ trading days of history for SMA200
+REGIME_LOOKBACK_DAYS = 260
 
 LOOP_SLEEP_SECONDS = 60
 
 # ============================================================
-# UNIVERSE (SEMIS, MINING, INDUSTRIALS)
+# UNIVERSE
 # ============================================================
 
 SEMICONDUCTOR_TICKERS = [
@@ -105,11 +92,15 @@ UNIVERSE = sorted(set(
 ))
 
 # ============================================================
-# ALPACA CREDENTIALS / HTTP
+# REPORT DIRECTORY
 # ============================================================
 
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "."))
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# ALPACA CREDENTIALS / HTTP
+# ============================================================
 
 ALPACA_API_KEY = ""
 ALPACA_API_SECRET = ""
@@ -121,12 +112,14 @@ _HTTP.headers.update({
     "Connection": "keep-alive",
 })
 
+
 def initialize_credentials():
     global ALPACA_API_KEY, ALPACA_API_SECRET
     ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
     ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
     if not ALPACA_API_KEY or not ALPACA_API_SECRET:
         raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET are not configured.")
+
 
 def alpaca_headers():
     return {
@@ -140,7 +133,6 @@ def alpaca_headers():
 # ============================================================
 
 def get_account_config():
-    """Read paper-account trading configuration directly from Alpaca."""
     url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
     r = requests.get(url, headers=alpaca_headers(), timeout=HTTP_TIMEOUT)
     if not r.ok:
@@ -151,7 +143,6 @@ def get_account_config():
 
 
 def update_account_config(payload):
-    """Update paper-account trading configuration directly through Alpaca."""
     url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
     r = requests.patch(
         url,
@@ -167,13 +158,6 @@ def update_account_config(payload):
 
 
 def verify_account_ready(trading_client):
-    """
-    Validate the paper account before the engine submits anything.
-
-    In particular, Alpaca's 40310000 / 'new orders are rejected by user
-    request' corresponds to suspend_trade=True. We read the configuration
-    directly from the paper Trading API and clear that flag when necessary.
-    """
     try:
         account = trading_client.get_account()
     except Exception as exc:
@@ -215,8 +199,6 @@ def verify_account_ready(trading_client):
         cfg.get("max_margin_multiplier"),
     )
 
-    # This is the specific account-level condition behind the error currently
-    # appearing in the user's log. Clear it before the engine starts scanning.
     if cfg.get("suspend_trade") is True:
         log.warning(
             "Alpaca paper account has suspend_trade=True. "
@@ -245,7 +227,7 @@ def verify_account_ready(trading_client):
     log.info("Alpaca paper account passed startup checks.")
 
 # ============================================================
-# ALPACA CLOCK (MARKET OPEN CHECK)
+# ALPACA CLOCK
 # ============================================================
 
 def alpaca_clock(trading_client):
@@ -254,6 +236,7 @@ def alpaca_clock(trading_client):
     except Exception as exc:
         log.warning("Failed to fetch Alpaca clock: %s", exc)
         return None
+
 
 def market_is_open(trading_client):
     clock = alpaca_clock(trading_client)
@@ -269,6 +252,7 @@ _BARS_CACHE = {}
 _OPTIONS_CACHE = {}
 _PRICE_CACHE = {}
 
+
 def cache_get(cache, key):
     item = cache.get(key)
     if not item:
@@ -277,6 +261,7 @@ def cache_get(cache, key):
     if time.time() - ts > DATA_CACHE_TTL_SECONDS:
         return None
     return value
+
 
 def cache_put(cache, key, value):
     cache[key] = (time.time(), value)
@@ -288,8 +273,10 @@ def cache_put(cache, key, value):
 def now_et():
     return datetime.now(EASTERN_TZ)
 
+
 def utc_now():
     return datetime.now(timezone.utc)
+
 
 def iso_utc(dt):
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -425,6 +412,7 @@ def alpaca_bars_many(symbols, days=60):
     cache_put(_BARS_CACHE, cache_key, result)
     return result
 
+
 def volatility_from_bars(bars, window=14):
     if not bars or len(bars) < window + 1:
         return None
@@ -444,6 +432,7 @@ def volatility_from_bars(bars, window=14):
     var = sum((r - mean) ** 2 for r in sample) / len(sample)
     return math.sqrt(var) * math.sqrt(TRADING_DAYS)
 
+
 def momentum_from_bars(bars, lookback=20):
     if not bars or len(bars) < lookback + 1:
         return None
@@ -453,7 +442,7 @@ def momentum_from_bars(bars, lookback=20):
         return None
 
 # ============================================================
-# REGIME (BULL / BEAR)
+# REGIME
 # ============================================================
 
 class RegimeManager:
@@ -499,6 +488,7 @@ class RegimeManager:
 def _cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
@@ -508,6 +498,7 @@ def bs_price(S, K, T, r, sigma, opt_type):
         return S * _cdf(d1) - K * math.exp(-r * T) * _cdf(d2)
     else:
         return K * math.exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
+
 
 def bs_delta(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -533,6 +524,7 @@ def monte_carlo_paths(S0, mu, sigma, T, steps=20, n_paths=500):
         paths.append(S)
     return paths
 
+
 def mc_expected_move(S0, mu, sigma, T):
     paths = monte_carlo_paths(S0, mu, sigma, T)
     if not paths:
@@ -541,7 +533,7 @@ def mc_expected_move(S0, mu, sigma, T):
     return (avg / S0) - 1.0
 
 # ============================================================
-# OPTION CHAIN + SANITY CHECKS
+# OPTION CHAIN
 # ============================================================
 
 def parse_occ_option_symbol(symbol):
@@ -559,6 +551,7 @@ def parse_occ_option_symbol(symbol):
         return root, expiration, opt_type, strike
     except Exception:
         return None
+
 
 def option_chain_calls(underlying):
     underlying = underlying.upper()
@@ -626,8 +619,6 @@ def option_chain_calls(underlying):
                 rejected_counts["spread"] += 1
                 continue
 
-            # Accept on EITHER signal since the indicative feed often
-            # reports volume=0 for contracts that are genuinely tradeable.
             liquid_enough = (
                 volume >= MIN_OPTION_VOLUME or
                 open_interest >= MIN_OPTION_OPEN_INTEREST
@@ -699,7 +690,7 @@ def latest_prices_many(symbols):
     return result
 
 # ============================================================
-# TRADING ENGINE (OPTIONS ONLY, HIGH RISK)
+# TRADING ENGINE
 # ============================================================
 
 class OptionsOnlyEngine:
@@ -735,19 +726,12 @@ class OptionsOnlyEngine:
     def submit_option_buy(self, contract, qty, regime_label, mc_move, bs_val_ratio):
         symbol = contract["symbol"]
 
-        # Alpaca generally rejects market orders on the options asset class —
-        # use a marketable limit order instead: ask + a small slippage buffer,
-        # rounded to a cent.
         limit_price = round(contract["ask"] * (1 + LIMIT_PRICE_SLIPPAGE_PCT), 2)
         if limit_price <= 0:
             log.warning("Skipping %s: computed non-positive limit price.", symbol)
             return
 
         try:
-            # Do not pass asset_class here. Alpaca infers the asset class
-            # from the OCC option symbol (for example JCI260918C00130000).
-            # This also avoids compatibility issues with SDK versions that
-            # do not expose AssetClass.OPTION.
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
@@ -789,7 +773,6 @@ class OptionsOnlyEngine:
             })
 
         except Exception as exc:
-            # Capture the API body so account-level rejections are obvious.
             detail = getattr(exc, "response", None)
             body = None
 
@@ -802,9 +785,6 @@ class OptionsOnlyEngine:
             combined = f"{exc} {body or ''}"
 
             if "40310000" in combined or "new orders are rejected by user request" in combined:
-                # Do not burn through the entire universe repeatedly when
-                # Alpaca has suspended new orders. Mark the daily limit as
-                # reached so the current cycle stops cleanly.
                 self.trades_today = MIN_TRADES_PER_DAY
                 log.critical(
                     "Alpaca rejected NEW ORDERS with 40310000 for %s. "
@@ -891,8 +871,6 @@ class OptionsOnlyEngine:
             return
 
         log.info("Loading market data for %d symbols...", len(UNIVERSE))
-        # Fetch enough history for the regime benchmark's SMA200, and a
-        # shorter window for everything else (momentum/vol only need ~40).
         bars_map = alpaca_bars_many(UNIVERSE, days=60)
         benchmark_bars = alpaca_bars_many([REGIME_BENCHMARK], days=REGIME_LOOKBACK_DAYS)
         bars_map[REGIME_BENCHMARK] = benchmark_bars.get(REGIME_BENCHMARK, [])
@@ -932,22 +910,23 @@ class OptionsOnlyEngine:
 
         try:
             df = pd.DataFrame(self.daily_log)
-            xlsx_file = f"options_summary_{date_str}.xlsx"
+            xlsx_file = REPORT_DIR / f"options_summary_{date_str}.xlsx"
             df.to_excel(xlsx_file, index=False)
             log.info("Daily Excel summary written to %s", xlsx_file)
         except Exception as exc:
             log.error("Failed to write Excel summary: %s", exc)
 
         try:
-            pdf_file = f"options_summary_{date_str}.pdf"
-            c = canvas.Canvas(pdf_file, pagesize=letter)
+            pdf_file = REPORT_DIR / f"options_summary_{date_str}.pdf"
+            c = canvas.Canvas(str(pdf_file), pagesize=letter)
             y = 750
             for row in self.daily_log:
                 line = (
                     f"{row['time']} | {row['contract']} | qty={row['qty']} | "
                     f"regime={row['regime']} | mc={row['mc_move_pct']:.2f}% | "
                     f"bs={row['bs_ratio']:.2f} | mid={row['mid']:.2f} | "
-                    f"delta={row['delta']:.2f} | iv={row['iv']:.2f}"
+                    f"delta={row['delta']:.2f} | iv={row['iv']:.2f} | "
+                    f"order_id={row['order_id']}"
                 )
                 c.drawString(30, y, line)
                 y -= 15
@@ -960,28 +939,23 @@ class OptionsOnlyEngine:
             log.error("Failed to write PDF summary: %s", exc)
 
 # ============================================================
-# MAIN LOOP
+# MAIN ENTRYPOINT
 # ============================================================
 
 def main():
     initialize_credentials()
-
-    try:
-        import alpaca
-        log.info("alpaca-py version=%s", getattr(alpaca, "__version__", "unknown"))
-    except Exception:
-        pass
-    log.info("Initializing Alpaca PAPER trading client")
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=True)
     verify_account_ready(trading_client)
+
     engine = OptionsOnlyEngine(trading_client)
 
     while True:
         try:
             engine.run_cycle()
         except Exception as exc:
-            log.error("Engine cycle error: %s", exc)
+            log.error("Engine cycle failed: %s", exc)
         time.sleep(LOOP_SLEEP_SECONDS)
+
 
 if __name__ == "__main__":
     main()
