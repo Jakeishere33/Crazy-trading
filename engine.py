@@ -14,7 +14,7 @@ from reportlab.pdfgen import canvas
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 
 # ============================================================
 # LOGGING
@@ -666,6 +666,10 @@ class OptionsOnlyEngine:
             return
 
         try:
+            # Do not pass asset_class here. Alpaca infers the asset class
+            # from the OCC option symbol (for example JCI260918C00130000).
+            # This also avoids compatibility issues with SDK versions that
+            # do not expose AssetClass.OPTION.
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
@@ -673,14 +677,25 @@ class OptionsOnlyEngine:
                 time_in_force=TimeInForce.DAY,
                 type=OrderType.LIMIT,
                 limit_price=limit_price,
-                asset_class=AssetClass.OPTION,
             )
-            self.trading.submit_order(order)
+
+            submitted_order = self.trading.submit_order(order)
             self.trades_today += 1
+
+            order_id = getattr(submitted_order, "id", "unknown")
+
             log.info(
-                "BUY %s x%d @ limit %.2f | regime=%s mc_move=%.2f%% bs_ratio=%.2f",
-                symbol, qty, limit_price, regime_label, mc_move * 100, bs_val_ratio,
+                "BUY %s x%d @ limit %.2f | regime=%s mc_move=%.2f%% "
+                "bs_ratio=%.2f | order_id=%s",
+                symbol,
+                qty,
+                limit_price,
+                regime_label,
+                mc_move * 100,
+                bs_val_ratio,
+                order_id,
             )
+
             self.daily_log.append({
                 "time": now_et().isoformat(),
                 "contract": symbol,
@@ -692,21 +707,26 @@ class OptionsOnlyEngine:
                 "mid": contract["mid"],
                 "delta": contract["delta"],
                 "iv": contract["iv"],
+                "order_id": str(order_id),
             })
+
         except Exception as exc:
-            # Surface the actual API error body when available — this is
-            # usually the fastest way to tell "not eligible for options",
-            # "insufficient buying power", "invalid contract", etc. apart.
+            # Surface the actual API response whenever available.
             detail = getattr(exc, "response", None)
             body = None
+
             if detail is not None:
                 try:
                     body = detail.text
                 except Exception:
                     body = None
+
             log.error(
                 "Order failed %s x%d @ %.2f: %s%s",
-                symbol, qty, limit_price, exc,
+                symbol,
+                qty,
+                limit_price,
+                exc,
                 f" | response={body}" if body else "",
             )
 
