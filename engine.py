@@ -13,7 +13,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
 
 # ============================================================
@@ -50,10 +50,25 @@ DATA_CACHE_TTL_SECONDS = 60
 
 OPTIONS_MIN_DTE = 20
 OPTIONS_MAX_DTE = 45
-MIN_OPTION_VOLUME = 50
-MAX_OPTION_SPREAD_PCT = 0.15
+
+# NOTE: the "indicative" options feed frequently returns volume=0 on
+# contracts that are perfectly tradeable (it isn't a live trade feed).
+# A hard `volume < MIN_OPTION_VOLUME` filter against that feed can silently
+# zero out every candidate. We now accept a contract if EITHER volume OR
+# open interest clears the bar, and both bars are configurable via env vars
+# so you can tighten them once you confirm the engine is actually finding
+# and submitting orders.
+MIN_OPTION_VOLUME = int(os.getenv("MIN_OPTION_VOLUME", "0"))
+MIN_OPTION_OPEN_INTEREST = int(os.getenv("MIN_OPTION_OPEN_INTEREST", "10"))
+MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.25"))
+
+# Limit order pricing: how far above the displayed ask we're willing to pay,
+# as a fraction of the mid price. Keeps orders marketable without being a
+# true market order (which Alpaca generally rejects for options).
+LIMIT_PRICE_SLIPPAGE_PCT = float(os.getenv("LIMIT_PRICE_SLIPPAGE_PCT", "0.03"))
 
 REGIME_BENCHMARK = "VOO"
+REGIME_LOOKBACK_DAYS = 260  # need 200+ trading days of history for SMA200
 
 LOOP_SLEEP_SECONDS = 60
 
@@ -94,7 +109,7 @@ ALPACA_API_SECRET = ""
 
 _HTTP = requests.Session()
 _HTTP.headers.update({
-    "User-Agent": "OptionsOnlyEngine/2.0",
+    "User-Agent": "OptionsOnlyEngine/2.1",
     "Accept": "application/json",
     "Connection": "keep-alive",
 })
@@ -112,6 +127,44 @@ def alpaca_headers():
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
         "Accept": "application/json",
     }
+
+# ============================================================
+# STARTUP DIAGNOSTICS
+# ============================================================
+
+def verify_account_ready(trading_client):
+    """
+    Fail loudly at startup instead of trading zero times forever.
+    Checks: account fetch works, account isn't restricted, and (best-effort)
+    options trading looks enabled.
+    """
+    try:
+        account = trading_client.get_account()
+    except Exception as exc:
+        log.error("Could not fetch account — check API key/secret and paper-trading flag: %s", exc)
+        raise
+
+    log.info(
+        "Account status=%s | equity=%s | buying_power=%s | options_trading_level=%s",
+        getattr(account, "status", "?"),
+        getattr(account, "equity", "?"),
+        getattr(account, "buying_power", "?"),
+        getattr(account, "options_trading_level", "unknown"),
+    )
+
+    trading_blocked = getattr(account, "trading_blocked", False)
+    if trading_blocked:
+        raise RuntimeError("Account has trading_blocked=True — orders will be rejected until this is cleared.")
+
+    options_level = getattr(account, "options_trading_level", None)
+    if options_level in (None, "disabled", 0):
+        log.warning(
+            "Could not confirm options trading is enabled on this account "
+            "(options_trading_level=%s). If orders keep failing with a 403/"
+            "not-eligible error, enable options trading for this paper "
+            "account before continuing.",
+            options_level,
+        )
 
 # ============================================================
 # ALPACA CLOCK (MARKET OPEN CHECK)
@@ -161,7 +214,7 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 def iso_utc(dt):
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # ============================================================
 # GENERIC ALPACA DATA GET
@@ -196,7 +249,7 @@ def alpaca_data_get(path, params=None, label=""):
                         delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 else:
                     delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2,0.8)
+                delay += random.uniform(0.2, 0.8)
                 log.warning(
                     "Rate limit (%s) %s attempt %d/%d. Sleeping %.1fs.",
                     label, path, attempt, DATA_MAX_RETRIES, delay,
@@ -206,7 +259,7 @@ def alpaca_data_get(path, params=None, label=""):
 
             if status >= 500:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2,0.8)
+                delay += random.uniform(0.2, 0.8)
                 log.warning(
                     "Server error %s (%s) attempt %d/%d. Retrying in %.1fs.",
                     status, label, attempt, DATA_MAX_RETRIES, delay,
@@ -224,7 +277,7 @@ def alpaca_data_get(path, params=None, label=""):
             last_error = exc
             if attempt < DATA_MAX_RETRIES:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2,0.8)
+                delay += random.uniform(0.2, 0.8)
                 log.warning(
                     "Request failed (%s) attempt %d/%d: %s. Retrying in %.1fs.",
                     label, attempt, DATA_MAX_RETRIES, exc, delay,
@@ -247,7 +300,7 @@ def alpaca_bars_many(symbols, days=60):
     if not symbols:
         return {}
 
-    days = min(int(days), 220)
+    days = min(int(days), 300)
     cache_key = (tuple(symbols), days, ALPACA_STOCK_FEED)
     cached = cache_get(_BARS_CACHE, cache_key)
     if cached is not None:
@@ -310,7 +363,7 @@ def volatility_from_bars(bars, window=14):
         return None
     sample = returns[-window:]
     mean = sum(sample) / len(sample)
-    var = sum((r - mean)**2 for r in sample) / len(sample)
+    var = sum((r - mean) ** 2 for r in sample) / len(sample)
     return math.sqrt(var) * math.sqrt(TRADING_DAYS)
 
 def momentum_from_bars(bars, lookback=20):
@@ -333,8 +386,8 @@ class RegimeManager:
         bars = self.market_data.get(REGIME_BENCHMARK, [])
         if len(bars) < 200:
             log.warning(
-                "Not enough %s history for regime calculation. Using neutral regime.",
-                REGIME_BENCHMARK,
+                "Not enough %s history for regime calculation (%d bars). Using neutral regime.",
+                REGIME_BENCHMARK, len(bars),
             )
             return 0.5
 
@@ -371,17 +424,17 @@ def _cdf(x):
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
-    d2 = d1 - sigma*math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
     if opt_type == "call":
-        return S*_cdf(d1) - K*math.exp(-r*T)*_cdf(d2)
+        return S * _cdf(d1) - K * math.exp(-r * T) * _cdf(d2)
     else:
-        return K*math.exp(-r*T)*_cdf(-d2) - S*_cdf(-d1)
+        return K * math.exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
 
 def bs_delta(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     if opt_type == "call":
         return _cdf(d1)
     else:
@@ -397,8 +450,8 @@ def monte_carlo_paths(S0, mu, sigma, T, steps=20, n_paths=500):
     for _ in range(n_paths):
         S = S0
         for _ in range(steps):
-            z = random.gauss(0,1)
-            S *= math.exp((mu - 0.5*sigma*sigma)*dt + sigma*math.sqrt(dt)*z)
+            z = random.gauss(0, 1)
+            S *= math.exp((mu - 0.5 * sigma * sigma) * dt + sigma * math.sqrt(dt) * z)
         paths.append(S)
     return paths
 
@@ -406,8 +459,8 @@ def mc_expected_move(S0, mu, sigma, T):
     paths = monte_carlo_paths(S0, mu, sigma, T)
     if not paths:
         return 0.0
-    avg = sum(paths)/len(paths)
-    return (avg/S0) - 1.0
+    avg = sum(paths) / len(paths)
+    return (avg / S0) - 1.0
 
 # ============================================================
 # OPTION CHAIN + SANITY CHECKS
@@ -423,8 +476,8 @@ def parse_occ_option_symbol(symbol):
         year = int(date_str[0:2])
         month = int(date_str[2:4])
         day = int(date_str[4:6])
-        expiration = datetime(2000+year, month, day).date()
-        strike = int(strike_str)/1000.0
+        expiration = datetime(2000 + year, month, day).date()
+        strike = int(strike_str) / 1000.0
         return root, expiration, opt_type, strike
     except Exception:
         return None
@@ -456,11 +509,15 @@ def option_chain_calls(underlying):
 
     snapshots = data.get("snapshots", {}) or {}
     contracts = []
+    rejected_counts = {
+        "bad_quote": 0, "spread": 0, "liquidity": 0, "parse": 0,
+    }
 
     if isinstance(snapshots, dict):
         for contract_symbol, snapshot in snapshots.items():
             parts = parse_occ_option_symbol(contract_symbol)
             if not parts:
+                rejected_counts["parse"] += 1
                 continue
             root, expiration, opt_type, strike = parts
             if opt_type != "C":
@@ -472,21 +529,33 @@ def option_chain_calls(underlying):
             trade = snapshot.get("latestTrade", {}) or {}
             greeks = snapshot.get("greeks", {}) or {}
 
-            bid = float(quote.get("bp",0) or 0)
-            ask = float(quote.get("ap",0) or 0)
-            volume = int(trade.get("s",0) or 0)
-            iv = float(snapshot.get("impliedVolatility",0) or 0)
-            delta = float(greeks.get("delta",0) or 0)
+            bid = float(quote.get("bp", 0) or 0)
+            ask = float(quote.get("ap", 0) or 0)
+            volume = int(trade.get("s", 0) or 0)
+            open_interest = int(snapshot.get("openInterest", 0) or 0)
+            iv = float(snapshot.get("impliedVolatility", 0) or 0)
+            delta = float(greeks.get("delta", 0) or 0)
 
             if bid <= 0 or ask <= 0 or ask < bid:
+                rejected_counts["bad_quote"] += 1
                 continue
-            mid = (bid+ask)/2.0
+            mid = (bid + ask) / 2.0
             if mid <= 0:
+                rejected_counts["bad_quote"] += 1
                 continue
-            spread_pct = (ask-bid)/mid
+            spread_pct = (ask - bid) / mid
             if spread_pct > MAX_OPTION_SPREAD_PCT:
+                rejected_counts["spread"] += 1
                 continue
-            if volume < MIN_OPTION_VOLUME:
+
+            # Accept on EITHER signal since the indicative feed often
+            # reports volume=0 for contracts that are genuinely tradeable.
+            liquid_enough = (
+                volume >= MIN_OPTION_VOLUME or
+                open_interest >= MIN_OPTION_OPEN_INTEREST
+            )
+            if not liquid_enough:
+                rejected_counts["liquidity"] += 1
                 continue
 
             contracts.append({
@@ -497,9 +566,18 @@ def option_chain_calls(underlying):
                 "ask": ask,
                 "mid": mid,
                 "volume": volume,
+                "open_interest": open_interest,
                 "delta": delta,
                 "iv": iv,
             })
+
+    if not contracts and snapshots:
+        log.info(
+            "%s: 0/%d contracts passed filters (bad_quote=%d spread=%d liquidity=%d parse=%d)",
+            underlying, len(snapshots),
+            rejected_counts["bad_quote"], rejected_counts["spread"],
+            rejected_counts["liquidity"], rejected_counts["parse"],
+        )
 
     cache_put(_OPTIONS_CACHE, cache_key, contracts)
     return contracts
@@ -578,25 +656,36 @@ class OptionsOnlyEngine:
 
     def submit_option_buy(self, contract, qty, regime_label, mc_move, bs_val_ratio):
         symbol = contract["symbol"]
+
+        # Alpaca generally rejects market orders on the options asset class —
+        # use a marketable limit order instead: ask + a small slippage buffer,
+        # rounded to a cent.
+        limit_price = round(contract["ask"] * (1 + LIMIT_PRICE_SLIPPAGE_PCT), 2)
+        if limit_price <= 0:
+            log.warning("Skipping %s: computed non-positive limit price.", symbol)
+            return
+
         try:
-            order = MarketOrderRequest(
+            order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                type=OrderType.MARKET,
+                type=OrderType.LIMIT,
+                limit_price=limit_price,
                 asset_class=AssetClass.OPTION,
             )
             self.trading.submit_order(order)
             self.trades_today += 1
             log.info(
-                "BUY %s x%d | regime=%s mc_move=%.2f%% bs_ratio=%.2f",
-                symbol, qty, regime_label, mc_move * 100, bs_val_ratio,
+                "BUY %s x%d @ limit %.2f | regime=%s mc_move=%.2f%% bs_ratio=%.2f",
+                symbol, qty, limit_price, regime_label, mc_move * 100, bs_val_ratio,
             )
             self.daily_log.append({
                 "time": now_et().isoformat(),
                 "contract": symbol,
                 "qty": qty,
+                "limit_price": limit_price,
                 "regime": regime_label,
                 "mc_move_pct": mc_move * 100,
                 "bs_ratio": bs_val_ratio,
@@ -605,7 +694,21 @@ class OptionsOnlyEngine:
                 "iv": contract["iv"],
             })
         except Exception as exc:
-            log.error("Order failed %s x%d: %s", symbol, qty, exc)
+            # Surface the actual API error body when available — this is
+            # usually the fastest way to tell "not eligible for options",
+            # "insufficient buying power", "invalid contract", etc. apart.
+            detail = getattr(exc, "response", None)
+            body = None
+            if detail is not None:
+                try:
+                    body = detail.text
+                except Exception:
+                    body = None
+            log.error(
+                "Order failed %s x%d @ %.2f: %s%s",
+                symbol, qty, limit_price, exc,
+                f" | response={body}" if body else "",
+            )
 
     def pick_contracts_for_symbol(self, symbol, bars, regime_label):
         if len(bars) < 40:
@@ -674,17 +777,24 @@ class OptionsOnlyEngine:
             return
 
         log.info("Loading market data for %d symbols...", len(UNIVERSE))
-        bars_map = alpaca_bars_many(UNIVERSE + [REGIME_BENCHMARK], days=60)
+        # Fetch enough history for the regime benchmark's SMA200, and a
+        # shorter window for everything else (momentum/vol only need ~40).
+        bars_map = alpaca_bars_many(UNIVERSE, days=60)
+        benchmark_bars = alpaca_bars_many([REGIME_BENCHMARK], days=REGIME_LOOKBACK_DAYS)
+        bars_map[REGIME_BENCHMARK] = benchmark_bars.get(REGIME_BENCHMARK, [])
 
         regime_mgr = RegimeManager(market_data=bars_map)
         regime_label, regime_score = regime_mgr.regime_label()
         log.info("Regime: %s (score=%.2f)", regime_label, regime_score)
 
+        symbols_with_picks = 0
         for symbol in UNIVERSE:
             if not self.can_trade_today():
                 break
             bars = bars_map.get(symbol, [])
             picks = self.pick_contracts_for_symbol(symbol, bars, regime_label)
+            if picks:
+                symbols_with_picks += 1
             for score, contract, mc_move, bs_ratio in picks:
                 if not self.can_trade_today():
                     break
@@ -695,7 +805,10 @@ class OptionsOnlyEngine:
                     bs_val_ratio=bs_ratio,
                 )
 
-        log.info("Cycle complete, trades today: %d", self.trades_today)
+        log.info(
+            "Cycle complete: %d/%d symbols produced candidates, trades today: %d",
+            symbols_with_picks, len(UNIVERSE), self.trades_today,
+        )
         self.write_daily_summary()
 
     def write_daily_summary(self):
@@ -739,6 +852,7 @@ class OptionsOnlyEngine:
 def main():
     initialize_credentials()
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=True)
+    verify_account_ready(trading_client)
     engine = OptionsOnlyEngine(trading_client)
 
     while True:
