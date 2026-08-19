@@ -26,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("options_only_engine")
+log = logging.getLogger("options_engine")
 
 # ============================================================
 # CONFIG
@@ -36,7 +36,9 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 TRADING_DAYS = 252
 RISK_FREE_ANNUAL = 0.04
 
-MIN_TRADES_PER_DAY = 100
+MIN_TRADES_PER_DAY = 30
+MAX_TRADES_PER_DAY = 90
+
 MAX_OPTION_CONTRACTS_PER_TICKER = 4
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
@@ -102,24 +104,18 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 # ALPACA CREDENTIALS / HTTP
 # ============================================================
 
-ALPACA_API_KEY = ""
-ALPACA_API_SECRET = ""
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
+
+if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+    raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET are not configured.")
 
 _HTTP = requests.Session()
 _HTTP.headers.update({
-    "User-Agent": "OptionsOnlyEngine/2.1",
+    "User-Agent": "OptionsEngine/3.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 })
-
-
-def initialize_credentials():
-    global ALPACA_API_KEY, ALPACA_API_SECRET
-    ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-    ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
-    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
-        raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET are not configured.")
-
 
 def alpaca_headers():
     return {
@@ -129,120 +125,17 @@ def alpaca_headers():
     }
 
 # ============================================================
-# STARTUP DIAGNOSTICS
+# TIME HELPERS
 # ============================================================
 
-def get_account_config():
-    url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
-    r = requests.get(url, headers=alpaca_headers(), timeout=HTTP_TIMEOUT)
-    if not r.ok:
-        raise RuntimeError(
-            f"Could not read Alpaca account configuration: HTTP {r.status_code} {r.text}"
-        )
-    return r.json()
+def now_et():
+    return datetime.now(EASTERN_TZ)
 
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def update_account_config(payload):
-    url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
-    r = requests.patch(
-        url,
-        headers={**alpaca_headers(), "Content-Type": "application/json"},
-        json=payload,
-        timeout=HTTP_TIMEOUT,
-    )
-    if not r.ok:
-        raise RuntimeError(
-            f"Could not update Alpaca account configuration: HTTP {r.status_code} {r.text}"
-        )
-    return r.json()
-
-
-def verify_account_ready(trading_client):
-    try:
-        account = trading_client.get_account()
-    except Exception as exc:
-        log.error(
-            "Could not fetch Alpaca account. Check that the API key/secret "
-            "are the PAPER keys: %s",
-            exc,
-        )
-        raise
-
-    log.info(
-        "Account status=%s | equity=%s | buying_power=%s | "
-        "trading_blocked=%s | account_blocked=%s",
-        getattr(account, "status", "?"),
-        getattr(account, "equity", "?"),
-        getattr(account, "buying_power", "?"),
-        getattr(account, "trading_blocked", "?"),
-        getattr(account, "account_blocked", "?"),
-    )
-
-    if getattr(account, "trading_blocked", False):
-        raise RuntimeError(
-            "Alpaca reports trading_blocked=True. The API will reject new orders."
-        )
-
-    if getattr(account, "account_blocked", False):
-        raise RuntimeError(
-            "Alpaca reports account_blocked=True. The API will reject trading."
-        )
-
-    cfg = get_account_config()
-
-    log.info(
-        "Account config | suspend_trade=%s | max_options_trading_level=%s | "
-        "no_shorting=%s | max_margin_multiplier=%s",
-        cfg.get("suspend_trade"),
-        cfg.get("max_options_trading_level"),
-        cfg.get("no_shorting"),
-        cfg.get("max_margin_multiplier"),
-    )
-
-    if cfg.get("suspend_trade") is True:
-        log.warning(
-            "Alpaca paper account has suspend_trade=True. "
-            "Clearing suspend_trade so new orders can be accepted."
-        )
-        cfg = update_account_config({"suspend_trade": False})
-        log.info(
-            "Trading suspension cleared. suspend_trade=%s",
-            cfg.get("suspend_trade"),
-        )
-
-    options_level = cfg.get("max_options_trading_level")
-    if options_level is not None:
-        try:
-            options_level = int(options_level)
-        except (TypeError, ValueError):
-            pass
-
-        if options_level == 0:
-            raise RuntimeError(
-                "Alpaca reports max_options_trading_level=0. "
-                "The paper account is not enabled for options trading. "
-                "Enable at least Level 2 for long calls/puts."
-            )
-
-    log.info("Alpaca paper account passed startup checks.")
-
-# ============================================================
-# ALPACA CLOCK
-# ============================================================
-
-def alpaca_clock(trading_client):
-    try:
-        return trading_client.get_clock()
-    except Exception as exc:
-        log.warning("Failed to fetch Alpaca clock: %s", exc)
-        return None
-
-
-def market_is_open(trading_client):
-    clock = alpaca_clock(trading_client)
-    if not clock:
-        return False
-    return bool(clock.is_open)
+def iso_utc(dt):
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # ============================================================
 # CACHE
@@ -251,7 +144,6 @@ def market_is_open(trading_client):
 _BARS_CACHE = {}
 _OPTIONS_CACHE = {}
 _PRICE_CACHE = {}
-
 
 def cache_get(cache, key):
     item = cache.get(key)
@@ -262,24 +154,8 @@ def cache_get(cache, key):
         return None
     return value
 
-
 def cache_put(cache, key, value):
     cache[key] = (time.time(), value)
-
-# ============================================================
-# TIME HELPERS
-# ============================================================
-
-def now_et():
-    return datetime.now(EASTERN_TZ)
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def iso_utc(dt):
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # ============================================================
 # GENERIC ALPACA DATA GET
@@ -300,62 +176,29 @@ def alpaca_data_get(path, params=None, label=""):
             status = resp.status_code
 
             if 200 <= status < 300:
-                try:
-                    return resp.json()
-                except ValueError as exc:
-                    raise RuntimeError(f"Invalid JSON returned by Alpaca: {exc}")
+                return resp.json()
 
             if status == 429:
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        delay = float(retry_after)
-                    except Exception:
-                        delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                else:
-                    delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
-                log.warning(
-                    "Rate limit (%s) %s attempt %d/%d. Sleeping %.1fs.",
-                    label, path, attempt, DATA_MAX_RETRIES, delay,
-                )
+                delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 time.sleep(delay)
                 continue
 
             if status >= 500:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
-                log.warning(
-                    "Server error %s (%s) attempt %d/%d. Retrying in %.1fs.",
-                    status, label, attempt, DATA_MAX_RETRIES, delay,
-                )
                 time.sleep(delay)
                 continue
 
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text[:500]
-            raise RuntimeError(f"Alpaca HTTP {status}: {body}")
+            raise RuntimeError(f"Alpaca HTTP {status}: {resp.text}")
 
         except Exception as exc:
             last_error = exc
             if attempt < DATA_MAX_RETRIES:
                 delay = DATA_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                delay += random.uniform(0.2, 0.8)
-                log.warning(
-                    "Request failed (%s) attempt %d/%d: %s. Retrying in %.1fs.",
-                    label, attempt, DATA_MAX_RETRIES, exc, delay,
-                )
                 time.sleep(delay)
             else:
-                log.error(
-                    "Request failed (%s) after %d attempts: %s",
-                    label, DATA_MAX_RETRIES, exc,
-                )
+                log.error("Request failed (%s): %s", label, exc)
 
     raise last_error or RuntimeError(f"Unknown Alpaca data failure: {label}")
-
 # ============================================================
 # HISTORICAL BARS / MOMENTUM / VOL
 # ============================================================
@@ -393,7 +236,6 @@ def alpaca_bars_many(symbols, days=60):
             data = alpaca_data_get("/v2/stocks/bars", params=params, label="bars")
             bars = data.get("bars", {})
             if not isinstance(bars, dict):
-                log.warning("Malformed Alpaca bars response for batch.")
                 continue
             for symbol in batch:
                 closes = []
@@ -407,11 +249,9 @@ def alpaca_bars_many(symbols, days=60):
                 result[symbol] = closes[-days:]
         except Exception as exc:
             log.error("Historical data batch failed: %s", exc)
-            continue
 
     cache_put(_BARS_CACHE, cache_key, result)
     return result
-
 
 def volatility_from_bars(bars, window=14):
     if not bars or len(bars) < window + 1:
@@ -431,7 +271,6 @@ def volatility_from_bars(bars, window=14):
     mean = sum(sample) / len(sample)
     var = sum((r - mean) ** 2 for r in sample) / len(sample)
     return math.sqrt(var) * math.sqrt(TRADING_DAYS)
-
 
 def momentum_from_bars(bars, lookback=20):
     if not bars or len(bars) < lookback + 1:
@@ -488,7 +327,6 @@ class RegimeManager:
 def _cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
@@ -498,16 +336,6 @@ def bs_price(S, K, T, r, sigma, opt_type):
         return S * _cdf(d1) - K * math.exp(-r * T) * _cdf(d2)
     else:
         return K * math.exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
-
-
-def bs_delta(S, K, T, r, sigma, opt_type):
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return 0.0
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    if opt_type == "call":
-        return _cdf(d1)
-    else:
-        return _cdf(d1) - 1.0
 
 # ============================================================
 # MONTE CARLO
@@ -523,7 +351,6 @@ def monte_carlo_paths(S0, mu, sigma, T, steps=20, n_paths=500):
             S *= math.exp((mu - 0.5 * sigma * sigma) * dt + sigma * math.sqrt(dt) * z)
         paths.append(S)
     return paths
-
 
 def mc_expected_move(S0, mu, sigma, T):
     paths = monte_carlo_paths(S0, mu, sigma, T)
@@ -552,7 +379,6 @@ def parse_occ_option_symbol(symbol):
     except Exception:
         return None
 
-
 def option_chain_calls(underlying):
     underlying = underlying.upper()
     today = now_et().date()
@@ -580,15 +406,11 @@ def option_chain_calls(underlying):
 
     snapshots = data.get("snapshots", {}) or {}
     contracts = []
-    rejected_counts = {
-        "bad_quote": 0, "spread": 0, "liquidity": 0, "parse": 0,
-    }
 
     if isinstance(snapshots, dict):
         for contract_symbol, snapshot in snapshots.items():
             parts = parse_occ_option_symbol(contract_symbol)
             if not parts:
-                rejected_counts["parse"] += 1
                 continue
             root, expiration, opt_type, strike = parts
             if opt_type != "C":
@@ -608,15 +430,12 @@ def option_chain_calls(underlying):
             delta = float(greeks.get("delta", 0) or 0)
 
             if bid <= 0 or ask <= 0 or ask < bid:
-                rejected_counts["bad_quote"] += 1
                 continue
             mid = (bid + ask) / 2.0
             if mid <= 0:
-                rejected_counts["bad_quote"] += 1
                 continue
             spread_pct = (ask - bid) / mid
             if spread_pct > MAX_OPTION_SPREAD_PCT:
-                rejected_counts["spread"] += 1
                 continue
 
             liquid_enough = (
@@ -624,7 +443,6 @@ def option_chain_calls(underlying):
                 open_interest >= MIN_OPTION_OPEN_INTEREST
             )
             if not liquid_enough:
-                rejected_counts["liquidity"] += 1
                 continue
 
             contracts.append({
@@ -639,14 +457,6 @@ def option_chain_calls(underlying):
                 "delta": delta,
                 "iv": iv,
             })
-
-    if not contracts and snapshots:
-        log.info(
-            "%s: 0/%d contracts passed filters (bad_quote=%d spread=%d liquidity=%d parse=%d)",
-            underlying, len(snapshots),
-            rejected_counts["bad_quote"], rejected_counts["spread"],
-            rejected_counts["liquidity"], rejected_counts["parse"],
-        )
 
     cache_put(_OPTIONS_CACHE, cache_key, contracts)
     return contracts
@@ -688,10 +498,104 @@ def latest_prices_many(symbols):
 
     cache_put(_PRICE_CACHE, cache_key, result)
     return result
-
 # ============================================================
 # TRADING ENGINE
 # ============================================================
+
+def alpaca_clock(trading_client):
+    try:
+        return trading_client.get_clock()
+    except Exception as exc:
+        log.warning("Failed to fetch Alpaca clock: %s", exc)
+        return None
+
+def market_is_open(trading_client):
+    clock = alpaca_clock(trading_client)
+    if not clock:
+        return False
+    return bool(clock.is_open)
+
+def verify_account_ready(trading_client):
+    try:
+        account = trading_client.get_account()
+    except Exception as exc:
+        log.error(
+            "Could not fetch Alpaca account. Check that the API key/secret "
+            "are the PAPER keys: %s",
+            exc,
+        )
+        raise
+
+    log.info(
+        "Account status=%s | equity=%s | buying_power=%s | "
+        "trading_blocked=%s | account_blocked=%s",
+        getattr(account, "status", "?"),
+        getattr(account, "equity", "?"),
+        getattr(account, "buying_power", "?"),
+        getattr(account, "trading_blocked", "?"),
+        getattr(account, "account_blocked", "?"),
+    )
+
+    if getattr(account, "trading_blocked", False):
+        raise RuntimeError(
+            "Alpaca reports trading_blocked=True. The API will reject new orders."
+        )
+
+    if getattr(account, "account_blocked", False):
+        raise RuntimeError(
+            "Alpaca reports account_blocked=True. The API will reject trading."
+        )
+
+    url = f"{ALPACA_PAPER_TRADING_URL}/account/configurations"
+    r = requests.get(url, headers=alpaca_headers(), timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(
+            f"Could not read Alpaca account configuration: HTTP {r.status_code} {r.text}"
+        )
+    cfg = r.json()
+
+    log.info(
+        "Account config | suspend_trade=%s | max_options_trading_level=%s | "
+        "no_shorting=%s | max_margin_multiplier=%s",
+        cfg.get("suspend_trade"),
+        cfg.get("max_options_trading_level"),
+        cfg.get("no_shorting"),
+        cfg.get("max_margin_multiplier"),
+    )
+
+    if cfg.get("suspend_trade") is True:
+        log.warning(
+            "Alpaca paper account has suspend_trade=True. "
+            "Clearing suspend_trade so new orders can be accepted."
+        )
+        r2 = requests.patch(
+            url,
+            headers={**alpaca_headers(), "Content-Type": "application/json"},
+            json={"suspend_trade": False},
+            timeout=HTTP_TIMEOUT,
+        )
+        if not r2.ok:
+            raise RuntimeError(
+                f"Could not clear suspend_trade: HTTP {r2.status_code} {r2.text}"
+            )
+        cfg = r2.json()
+        log.info("Trading suspension cleared. suspend_trade=%s", cfg.get("suspend_trade"))
+
+    options_level = cfg.get("max_options_trading_level")
+    if options_level is not None:
+        try:
+            options_level = int(options_level)
+        except (TypeError, ValueError):
+            pass
+
+        if options_level == 0:
+            raise RuntimeError(
+                "Alpaca reports max_options_trading_level=0. "
+                "The paper account is not enabled for options trading. "
+                "Enable at least Level 2 for long calls/puts."
+            )
+
+    log.info("Alpaca paper account passed startup checks.")
 
 class OptionsOnlyEngine:
 
@@ -707,9 +611,10 @@ class OptionsOnlyEngine:
             self.trades_today = 0
             self.last_trade_day = today
             self.daily_log = []
+            log.info("New trading day started.")
 
     def can_trade_today(self):
-        return self.trades_today < MIN_TRADES_PER_DAY
+        return self.trades_today < MAX_TRADES_PER_DAY
 
     def positions(self):
         try:
@@ -785,12 +690,10 @@ class OptionsOnlyEngine:
             combined = f"{exc} {body or ''}"
 
             if "40310000" in combined or "new orders are rejected by user request" in combined:
-                self.trades_today = MIN_TRADES_PER_DAY
+                self.trades_today = MAX_TRADES_PER_DAY
                 log.critical(
                     "Alpaca rejected NEW ORDERS with 40310000 for %s. "
-                    "Trading has been halted for this run. "
-                    "The startup configuration check should normally clear "
-                    "suspend_trade automatically.",
+                    "Trading has been halted for this run.",
                     symbol,
                 )
                 return
@@ -858,6 +761,41 @@ class OptionsOnlyEngine:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[:MAX_OPTION_CONTRACTS_PER_TICKER]
 
+    def write_daily_summary(self):
+        if not self.daily_log:
+            return
+        date_str = now_et().strftime("%Y-%m-%d")
+
+        try:
+            df = pd.DataFrame(self.daily_log)
+            xlsx_file = REPORT_DIR / f"options_summary_{date_str}.xlsx"
+            df.to_excel(xlsx_file, index=False)
+            log.info("Daily Excel summary written to %s", xlsx_file)
+        except Exception as exc:
+            log.error("Failed to write Excel summary: %s", exc)
+
+        try:
+            pdf_file = REPORT_DIR / f"options_summary_{date_str}.pdf"
+            c = canvas.Canvas(str(pdf_file), pagesize=letter)
+            y = 750
+            for row in self.daily_log:
+                line = (
+                    f"{row['time']} | {row['contract']} | qty={row['qty']} | "
+                    f"regime={row['regime']} | mc={row['mc_move_pct']:.2f}% | "
+                    f"bs={row['bs_ratio']:.2f} | mid={row['mid']:.2f} | "
+                    f"delta={row['delta']:.2f} | iv={row['iv']:.2f} | "
+                    f"order_id={row['order_id']}"
+                )
+                c.drawString(40, y, line)
+                y -= 14
+                if y < 40:
+                    c.showPage()
+                    y = 750
+            c.save()
+            log.info("Daily PDF summary written to %s", pdf_file)
+        except Exception as exc:
+            log.error("Failed to write PDF summary: %s", exc)
+
     def run_cycle(self):
         self.reset_if_new_day()
 
@@ -866,7 +804,7 @@ class OptionsOnlyEngine:
             return
 
         if not self.can_trade_today():
-            log.info("Daily trade target already met (%d)", self.trades_today)
+            log.info("Daily trade cap reached (%d)", self.trades_today)
             self.write_daily_summary()
             return
 
@@ -902,48 +840,12 @@ class OptionsOnlyEngine:
             symbols_with_picks, len(UNIVERSE), self.trades_today,
         )
         self.write_daily_summary()
-
-    def write_daily_summary(self):
-        if not self.daily_log:
-            return
-        date_str = now_et().strftime("%Y-%m-%d")
-
-        try:
-            df = pd.DataFrame(self.daily_log)
-            xlsx_file = REPORT_DIR / f"options_summary_{date_str}.xlsx"
-            df.to_excel(xlsx_file, index=False)
-            log.info("Daily Excel summary written to %s", xlsx_file)
-        except Exception as exc:
-            log.error("Failed to write Excel summary: %s", exc)
-
-        try:
-            pdf_file = REPORT_DIR / f"options_summary_{date_str}.pdf"
-            c = canvas.Canvas(str(pdf_file), pagesize=letter)
-            y = 750
-            for row in self.daily_log:
-                line = (
-                    f"{row['time']} | {row['contract']} | qty={row['qty']} | "
-                    f"regime={row['regime']} | mc={row['mc_move_pct']:.2f}% | "
-                    f"bs={row['bs_ratio']:.2f} | mid={row['mid']:.2f} | "
-                    f"delta={row['delta']:.2f} | iv={row['iv']:.2f} | "
-                    f"order_id={row['order_id']}"
-                )
-                c.drawString(30, y, line)
-                y -= 15
-                if y < 50:
-                    c.showPage()
-                    y = 750
-            c.save()
-            log.info("Daily PDF summary written to %s", pdf_file)
-        except Exception as exc:
-            log.error("Failed to write PDF summary: %s", exc)
-
-# ============================================================
-# MAIN ENTRYPOINT
+r# ============================================================
+# MAIN LOOP (EVERY 60 SECONDS)
 # ============================================================
 
 def main():
-    initialize_credentials()
+    log.info("Starting OptionsOnlyEngine...")
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=True)
     verify_account_ready(trading_client)
 
@@ -953,9 +855,8 @@ def main():
         try:
             engine.run_cycle()
         except Exception as exc:
-            log.error("Engine cycle failed: %s", exc)
+            log.error("Cycle error: %s", exc)
         time.sleep(LOOP_SLEEP_SECONDS)
-
 
 if __name__ == "__main__":
     main()
