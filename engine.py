@@ -199,7 +199,6 @@ def alpaca_data_get(path, params=None, label=""):
                 log.error("Request failed (%s): %s", label, exc)
 
     raise last_error or RuntimeError(f"Unknown Alpaca data failure: {label}")
-
 # ============================================================
 # HISTORICAL BARS / MOMENTUM / VOL
 # ============================================================
@@ -499,8 +498,7 @@ def latest_prices_many(symbols):
 
     cache_put(_PRICE_CACHE, cache_key, result)
     return result
-
-# ============================================================
+    # ============================================================
 # TRADING ENGINE
 # ============================================================
 
@@ -630,6 +628,32 @@ class OptionsOnlyEngine:
         pos = self.positions()
         return {s for s in pos.keys() if len(s) > 5}
 
+    def count_contracts_for_ticker(self, ticker):
+        positions = self.positions()
+        count = 0
+        for sym, pos in positions.items():
+            if sym.startswith(ticker):
+                try:
+                    count += int(float(pos.qty))
+                except Exception:
+                    continue
+        return count
+
+    def submit_option_sell(self, symbol, qty):
+        try:
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                type=OrderType.MARKET,
+            )
+            submitted_order = self.trading.submit_order(order)
+            order_id = getattr(submitted_order, "id", "unknown")
+            log.info("SELL %s x%d | order_id=%s", symbol, qty, order_id)
+        except Exception as exc:
+            log.error("Sell failed for %s: %s", symbol, exc)
+
     def submit_option_buy(self, contract, qty, regime_label, mc_move, bs_val_ratio):
         symbol = contract["symbol"]
 
@@ -691,7 +715,6 @@ class OptionsOnlyEngine:
 
             combined = f"{exc} {body or ''}"
 
-            # FIXED: do NOT force trades_today = MAX_TRADES_PER_DAY
             if "40310000" in combined or "new orders are rejected by user request" in combined:
                 log.warning(
                     "Alpaca rejected NEW ORDERS with 40310000 for %s. Skipping this contract.",
@@ -707,6 +730,18 @@ class OptionsOnlyEngine:
                 exc,
                 f" | response={body}" if body else "",
             )
+
+    def auto_sell_duplicates(self):
+        positions = self.positions()
+        for sym, pos in positions.items():
+            try:
+                qty = int(float(pos.qty))
+            except Exception:
+                qty = 0
+            if qty > 1:
+                sell_qty = qty - 1
+                log.warning("Auto-selling duplicate contracts: %s x%d", sym, sell_qty)
+                self.submit_option_sell(sym, sell_qty)
 
     def pick_contracts_for_symbol(self, symbol, bars, regime_label):
         if len(bars) < 40:
@@ -735,6 +770,11 @@ class OptionsOnlyEngine:
             return []
 
         existing_opts = self.existing_option_symbols()
+        ticker = symbol.upper()
+
+        if self.count_contracts_for_ticker(ticker) >= 3:
+            return []
+
         candidates = []
 
         for c in chain:
@@ -799,6 +839,7 @@ class OptionsOnlyEngine:
 
     def run_cycle(self):
         self.reset_if_new_day()
+        self.auto_sell_duplicates()
 
         if not market_is_open(self.trading):
             log.info("Alpaca clock: market closed, skipping cycle.")
@@ -841,8 +882,7 @@ class OptionsOnlyEngine:
             symbols_with_picks, len(UNIVERSE), self.trades_today,
         )
         self.write_daily_summary()
-
-# ============================================================
+        # ============================================================
 # MAIN LOOP (EVERY 60 SECONDS)
 # ============================================================
 
@@ -862,3 +902,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
