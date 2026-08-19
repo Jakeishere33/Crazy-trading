@@ -840,7 +840,7 @@ class OptionsOnlyEngine:
             symbols_with_picks, len(UNIVERSE), self.trades_today,
         )
         self.write_daily_summary()
-r# ============================================================
+# ============================================================
 # MAIN LOOP (EVERY 60 SECONDS)
 # ============================================================
 
