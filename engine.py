@@ -199,6 +199,7 @@ def alpaca_data_get(path, params=None, label=""):
                 log.error("Request failed (%s): %s", label, exc)
 
     raise last_error or RuntimeError(f"Unknown Alpaca data failure: {label}")
+
 # ============================================================
 # HISTORICAL BARS / MOMENTUM / VOL
 # ============================================================
@@ -498,6 +499,7 @@ def latest_prices_many(symbols):
 
     cache_put(_PRICE_CACHE, cache_key, result)
     return result
+
 # ============================================================
 # TRADING ENGINE
 # ============================================================
@@ -689,11 +691,10 @@ class OptionsOnlyEngine:
 
             combined = f"{exc} {body or ''}"
 
+            # FIXED: do NOT force trades_today = MAX_TRADES_PER_DAY
             if "40310000" in combined or "new orders are rejected by user request" in combined:
-                self.trades_today = MAX_TRADES_PER_DAY
-                log.critical(
-                    "Alpaca rejected NEW ORDERS with 40310000 for %s. "
-                    "Trading has been halted for this run.",
+                log.warning(
+                    "Alpaca rejected NEW ORDERS with 40310000 for %s. Skipping this contract.",
                     symbol,
                 )
                 return
@@ -840,6 +841,7 @@ class OptionsOnlyEngine:
             symbols_with_picks, len(UNIVERSE), self.trades_today,
         )
         self.write_daily_summary()
+
 # ============================================================
 # MAIN LOOP (EVERY 60 SECONDS)
 # ============================================================
